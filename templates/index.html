@@ -1,0 +1,684 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maps Scraper — Lead Dashboard</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+  <style>
+    :root {
+      --bg:       #0d1117;
+      --surface:  #161b22;
+      --surface2: #21262d;
+      --border:   #30363d;
+      --text:     #e6edf3;
+      --muted:    #8b949e;
+      --accent:   #58a6ff;
+      --green:    #3fb950;
+      --orange:   #f0883e;
+      --red:      #f85149;
+      --purple:   #bc8cff;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      font-size: 14px;
+      min-height: 100vh;
+    }
+
+    /* ── Navbar ── */
+    .topbar {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 0.75rem 1.5rem;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .topbar-brand { font-weight: 700; font-size: 1rem; letter-spacing: -0.02em; }
+    .topbar-sep { color: var(--border); }
+    .topbar-stat { font-size: 0.8rem; color: var(--muted); }
+    .topbar-stat b { color: var(--text); }
+    .topbar-stat.green b { color: var(--green); }
+
+    /* ── Cards ── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .card-hd {
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      padding: 0.6rem 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+    }
+    .card-body { padding: 1rem; }
+
+    /* ── Form controls ── */
+    .form-control, .form-select {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.85rem;
+      border-radius: 6px;
+    }
+    .form-control:focus, .form-select:focus {
+      background: var(--surface2);
+      border-color: var(--accent);
+      color: var(--text);
+      box-shadow: 0 0 0 3px rgba(88,166,255,.15);
+    }
+    .form-control::placeholder { color: var(--muted); }
+    label.lbl {
+      display: block;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted);
+      margin-bottom: 4px;
+    }
+
+    /* ── Buttons ── */
+    .btn-accent {
+      background: var(--accent);
+      border: none;
+      color: #0d1117;
+      font-weight: 700;
+      font-size: 0.85rem;
+      border-radius: 6px;
+      padding: 0.45rem 1rem;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn-accent:hover { opacity: .85; }
+    .btn-accent:disabled { opacity: .45; cursor: not-allowed; }
+    .btn-green {
+      background: var(--green);
+      border: none;
+      color: #0d1117;
+      font-weight: 700;
+      font-size: 0.8rem;
+      border-radius: 6px;
+      padding: 0.35rem 0.85rem;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn-green:hover { opacity: .85; }
+    .btn-ghost {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-size: 0.8rem;
+      border-radius: 6px;
+      padding: 0.3rem 0.75rem;
+      cursor: pointer;
+    }
+    .btn-ghost:hover { background: var(--border); }
+    .btn-ghost:disabled { opacity: .4; cursor: not-allowed; }
+
+    /* ── Tabs (inline) ── */
+    .tab-row { display: flex; gap: 4px; }
+    .tab-btn {
+      padding: 3px 12px;
+      border-radius: 4px;
+      font-size: 0.78rem;
+      font-weight: 600;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--muted);
+      transition: all .15s;
+    }
+    .tab-btn.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #0d1117;
+    }
+
+    /* ── Stat cards ── */
+    .stat-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 1rem 1.25rem;
+    }
+    .stat-val { font-size: 1.9rem; font-weight: 800; line-height: 1; }
+    .stat-lbl { font-size: 0.7rem; font-weight: 600; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-top: 4px; }
+
+    /* ── Job cards ── */
+    .job-card {
+      background: var(--surface2);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.8rem 1rem;
+      margin-bottom: 8px;
+    }
+    .job-card:last-child { margin-bottom: 0; }
+
+    /* ── Progress bar ── */
+    .prog-track {
+      background: var(--border);
+      height: 5px;
+      border-radius: 3px;
+      overflow: hidden;
+      margin: 6px 0;
+    }
+    .prog-fill {
+      height: 100%;
+      border-radius: 3px;
+      transition: width .4s ease;
+    }
+
+    /* ── Status badges ── */
+    .badge-running   { background: rgba(88,166,255,.15); color: var(--accent); }
+    .badge-completed { background: rgba(63,185,80,.15);  color: var(--green);  }
+    .badge-failed    { background: rgba(248,81,73,.15);  color: var(--red);    }
+    .badge-pending   { background: rgba(240,136,62,.15); color: var(--orange); }
+    .status-badge {
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      padding: 2px 8px;
+      border-radius: 20px;
+    }
+
+    /* ── Category bars ── */
+    .cat-row { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; }
+    .cat-row:last-child { margin-bottom: 0; }
+    .cat-name { font-size: 0.78rem; color: var(--muted); min-width: 130px; max-width: 130px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cat-track { flex: 1; background: var(--border); height: 7px; border-radius: 4px; overflow: hidden; }
+    .cat-fill { height: 100%; border-radius: 4px; background: var(--accent); opacity: .7; }
+    .cat-count { font-size: 0.75rem; color: var(--muted); min-width: 40px; text-align: right; }
+
+    /* ── Leads table ── */
+    .leads-wrap { overflow-x: auto; max-height: 460px; overflow-y: auto; }
+    .leads-wrap table { font-size: 0.78rem; border-collapse: collapse; width: 100%; }
+    .leads-wrap thead th {
+      position: sticky; top: 0; z-index: 2;
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      padding: 7px 10px;
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+    .leads-wrap tbody td { padding: 7px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .leads-wrap tbody tr:hover td { background: rgba(255,255,255,.03); }
+    .leads-wrap tbody tr:last-child td { border-bottom: none; }
+    .cell-name { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+    .cell-url  { font-size: 0.72rem; color: var(--accent); text-decoration: none; display: block; max-width: 160px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .cell-url:hover { text-decoration: underline; }
+    .chip { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 0.68rem; background: var(--surface2); border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+    .email-cell { color: var(--green); }
+
+    /* ── Filter bar ── */
+    .filter-bar {
+      background: var(--surface2);
+      border-bottom: 1px solid var(--border);
+      padding: 0.6rem 1rem;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      align-items: flex-end;
+    }
+    .filter-group { display: flex; flex-direction: column; gap: 4px; }
+
+    /* ── Pagination ── */
+    .pager {
+      border-top: 1px solid var(--border);
+      padding: 0.5rem 1rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    /* ── Scrollbar ── */
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: var(--bg); }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+    /* ── Range input ── */
+    input[type=range] { accent-color: var(--accent); cursor: pointer; }
+
+    /* ── Switch ── */
+    .form-check-input:checked { background-color: var(--accent); border-color: var(--accent); }
+
+    .empty-msg { color: var(--muted); font-size: 0.82rem; text-align: center; padding: 2rem 0; }
+  </style>
+</head>
+<body>
+
+<!-- ── Top bar ──────────────────────────────────────────────────────────── -->
+<div class="topbar">
+  <span class="topbar-brand">&#9992;&#65039; Maps Scraper</span>
+  <span class="topbar-sep">|</span>
+  <span class="topbar-stat">Total leads: <b id="nb-total">—</b></span>
+  <span class="topbar-stat green">Emails found: <b id="nb-emails">—</b></span>
+  <span class="topbar-stat">Coverage: <b id="nb-pct">—</b></span>
+</div>
+
+<!-- ── Main layout ──────────────────────────────────────────────────────── -->
+<div style="max-width:1380px;margin:0 auto;padding:1.25rem 1.25rem 2rem">
+  <div class="row g-3">
+
+    <!-- ── LEFT COLUMN: New Job + Queue ── -->
+    <div class="col-12 col-xl-4">
+
+      <!-- New Job form -->
+      <div class="card mb-3">
+        <div class="card-hd">
+          <span>New Scrape Job</span>
+        </div>
+        <div class="card-body">
+          <div class="mb-3">
+            <label class="lbl">Keyword</label>
+            <input type="text" class="form-control" id="inp-keyword"
+              placeholder='e.g. "plumbers" or "HVAC contractors"'>
+          </div>
+
+          <!-- State / Custom zips toggle -->
+          <div class="mb-3">
+            <label class="lbl" style="margin-bottom:6px">Target Zips</label>
+            <div class="tab-row mb-2">
+              <button class="tab-btn active" id="tab-state" onclick="switchZipTab('state')">By State</button>
+              <button class="tab-btn"        id="tab-custom" onclick="switchZipTab('custom')">Custom Zips</button>
+            </div>
+            <div id="panel-state">
+              <select class="form-select" id="inp-state">
+                <option value="">— Select a state —</option>
+                {% for abbr, name in states|dictsort(by='value') %}
+                <option value="{{ abbr }}">{{ name }}</option>
+                {% endfor %}
+              </select>
+            </div>
+            <div id="panel-custom" style="display:none">
+              <textarea class="form-control" id="inp-zips" rows="3"
+                style="resize:vertical;font-size:0.82rem"
+                placeholder="Comma or newline-separated zip codes&#10;e.g. 10001, 90210, 77001"></textarea>
+            </div>
+          </div>
+
+          <div class="mb-3">
+            <label class="lbl">RapidAPI Key</label>
+            <input type="password" class="form-control" id="inp-apikey"
+              placeholder="Paste your key here">
+          </div>
+
+          <button class="btn-accent w-100" id="btn-start" onclick="startJob()">
+            <i class="bi bi-play-fill"></i>&nbsp; Start Scrape
+          </button>
+          <div id="job-error" class="mt-2" style="color:var(--red);font-size:0.8rem;display:none"></div>
+        </div>
+      </div>
+
+      <!-- Job Queue -->
+      <div class="card">
+        <div class="card-hd">
+          <span>Job Queue</span>
+          <span id="job-count" style="font-size:0.75rem;color:var(--muted);text-transform:none;letter-spacing:0">0 jobs</span>
+        </div>
+        <div class="card-body" id="jobs-list" style="padding:0.75rem">
+          <div class="empty-msg">No jobs yet. Start a scrape above.</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── RIGHT COLUMN: Stats + Leads ── -->
+    <div class="col-12 col-xl-8">
+
+      <!-- Stat cards -->
+      <div class="row g-3 mb-3">
+        <div class="col-4">
+          <div class="stat-card">
+            <div class="stat-val" id="stat-total">—</div>
+            <div class="stat-lbl">Total Leads</div>
+          </div>
+        </div>
+        <div class="col-4">
+          <div class="stat-card">
+            <div class="stat-val" style="color:var(--green)" id="stat-emails">—</div>
+            <div class="stat-lbl">With Email</div>
+          </div>
+        </div>
+        <div class="col-4">
+          <div class="stat-card">
+            <div class="stat-val" style="color:var(--accent)" id="stat-pct">—</div>
+            <div class="stat-lbl">Email Coverage</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Top Categories -->
+      <div class="card mb-3">
+        <div class="card-hd"><span>Top Categories</span></div>
+        <div class="card-body" id="cats-body">
+          <div class="empty-msg">No data yet.</div>
+        </div>
+      </div>
+
+      <!-- Leads table + filters + export -->
+      <div class="card">
+        <div class="card-hd">
+          <span>Leads</span>
+          <button class="btn-green" onclick="exportCSV()">
+            <i class="bi bi-download"></i>&nbsp;Export CSV
+          </button>
+        </div>
+
+        <!-- Filter bar -->
+        <div class="filter-bar">
+          <div class="filter-group">
+            <label class="lbl">Min Rating</label>
+            <div style="display:flex;align-items:center;gap:6px">
+              <input type="range" id="f-rating" min="0" max="5" step="0.5" value="0"
+                style="width:90px" oninput="fRatingVal.textContent=this.value;scheduleLeadLoad()">
+              <span id="fRatingVal" style="min-width:22px;font-size:0.8rem">0</span>
+            </div>
+          </div>
+
+          <div class="filter-group">
+            <label class="lbl">Min Reviews</label>
+            <input type="number" class="form-control" id="f-reviews" value="0" min="0"
+              style="width:80px" oninput="scheduleLeadLoad()">
+          </div>
+
+          <div class="filter-group">
+            <label class="lbl">Category</label>
+            <select class="form-select" id="f-category" onchange="loadLeads(1)" style="min-width:150px">
+              <option value="">All categories</option>
+            </select>
+          </div>
+
+          <div class="filter-group" style="justify-content:flex-end;padding-bottom:2px">
+            <label class="lbl">Has Email</label>
+            <div class="form-check form-switch mb-0" style="padding-left:2.5rem">
+              <input class="form-check-input" type="checkbox" id="f-email" role="switch" onchange="loadLeads(1)">
+            </div>
+          </div>
+
+          <div class="filter-group ms-auto" style="justify-content:flex-end;padding-bottom:4px">
+            <span id="leads-total-lbl" style="font-size:0.78rem;color:var(--muted)"></span>
+          </div>
+        </div>
+
+        <!-- Table -->
+        <div class="leads-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Business</th>
+                <th>Phone</th>
+                <th>Email</th>
+                <th>Rating</th>
+                <th>Reviews</th>
+                <th>Category</th>
+                <th>Zip</th>
+              </tr>
+            </thead>
+            <tbody id="leads-tbody">
+              <tr><td colspan="7"><div class="empty-msg">No leads yet.</div></td></tr>
+            </tbody>
+          </table>
+        </div>
+
+        <!-- Pagination -->
+        <div class="pager">
+          <button class="btn-ghost" id="btn-prev" onclick="changePage(-1)" disabled>&#8249; Prev</button>
+          <span id="page-info" style="font-size:0.78rem;color:var(--muted)">Page 1 of 1</span>
+          <button class="btn-ghost" id="btn-next" onclick="changePage(1)">Next &#8250;</button>
+        </div>
+      </div>
+
+    </div><!-- /right col -->
+  </div><!-- /row -->
+</div><!-- /container -->
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let currentPage  = 1;
+let totalPages   = 1;
+let pollTimer    = null;
+let leadTimer    = null;
+
+// ── Zip-tab switching ──────────────────────────────────────────────────────
+function switchZipTab(tab) {
+  const isState = (tab === 'state');
+  document.getElementById('panel-state').style.display  = isState ? '' : 'none';
+  document.getElementById('panel-custom').style.display = isState ? 'none' : '';
+  document.getElementById('tab-state').classList.toggle('active',  isState);
+  document.getElementById('tab-custom').classList.toggle('active', !isState);
+}
+
+// ── Start job ──────────────────────────────────────────────────────────────
+async function startJob() {
+  const keyword    = document.getElementById('inp-keyword').value.trim();
+  const apiKey     = document.getElementById('inp-apikey').value.trim();
+  const state      = document.getElementById('inp-state').value;
+  const customZips = document.getElementById('inp-zips').value;
+  const errEl      = document.getElementById('job-error');
+  errEl.style.display = 'none';
+
+  const btn = document.getElementById('btn-start');
+  btn.disabled = true;
+  btn.textContent = 'Starting…';
+
+  try {
+    const res = await fetch('/api/jobs', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({keyword, api_key: apiKey, state, custom_zips: customZips}),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = data.error || 'Unknown error';
+      errEl.style.display = '';
+      return;
+    }
+    ensurePolling();
+  } finally {
+    setTimeout(() => {
+      btn.disabled = false;
+      btn.innerHTML = '<i class="bi bi-play-fill"></i>&nbsp; Start Scrape';
+    }, 1500);
+  }
+}
+
+// ── Polling ────────────────────────────────────────────────────────────────
+function ensurePolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(async () => {
+    await refreshJobs();
+    await refreshStats();
+  }, 2000);
+}
+
+async function refreshJobs() {
+  const res  = await fetch('/api/jobs');
+  const jobs = await res.json();
+
+  document.getElementById('job-count').textContent =
+    jobs.length + ' job' + (jobs.length !== 1 ? 's' : '');
+
+  const el = document.getElementById('jobs-list');
+
+  if (!jobs.length) {
+    el.innerHTML = '<div class="empty-msg">No jobs yet. Start a scrape above.</div>';
+    return;
+  }
+
+  el.innerHTML = jobs.map(j => {
+    const pct   = j.total ? Math.round((j.processed / j.total) * 100) : 0;
+    const color = {running:'var(--accent)', completed:'var(--green)', failed:'var(--red)', pending:'var(--orange)'}[j.status] || 'var(--muted)';
+    return `
+      <div class="job-card">
+        <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
+          <div>
+            <span style="font-weight:600;font-size:0.85rem">${esc(j.keyword)}</span>
+            ${j.state ? `<span class="chip ms-1">${esc(j.state)}</span>` : ''}
+          </div>
+          <span class="status-badge badge-${j.status}">${j.status}</span>
+        </div>
+        <div class="prog-track">
+          <div class="prog-fill" style="width:${pct}%;background:${color}"></div>
+        </div>
+        <div style="display:flex;gap:12px;font-size:0.73rem;color:var(--muted)">
+          <span>${j.processed}/${j.total} zips</span>
+          <span style="color:var(--green)">+${j.inserted.toLocaleString()} new</span>
+          <span>${j.duplicates.toLocaleString()} dup</span>
+          <span style="margin-left:auto">${pct}%</span>
+        </div>
+        ${j.error ? `<div style="color:var(--red);font-size:0.72rem;margin-top:4px">${esc(j.error)}</div>` : ''}
+      </div>`;
+  }).join('');
+
+  // Stop polling if all jobs settled, then reload leads
+  const hasActive = jobs.some(j => j.status === 'running' || j.status === 'pending');
+  if (!hasActive) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    loadLeads(currentPage);
+  }
+}
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+async function refreshStats() {
+  const res = await fetch('/api/stats');
+  const d   = await res.json();
+
+  const pct = d.total ? Math.round((d.with_email / d.total) * 100) : 0;
+
+  document.getElementById('stat-total').textContent  = d.total.toLocaleString();
+  document.getElementById('stat-emails').textContent = d.with_email.toLocaleString();
+  document.getElementById('stat-pct').textContent    = pct + '%';
+
+  // Topbar
+  document.getElementById('nb-total').textContent  = d.total.toLocaleString();
+  document.getElementById('nb-emails').textContent = d.with_email.toLocaleString();
+  document.getElementById('nb-pct').textContent    = pct + '%';
+
+  // Category bars
+  const catsEl = document.getElementById('cats-body');
+  if (!d.categories.length) {
+    catsEl.innerHTML = '<div class="empty-msg">No data yet.</div>';
+    return;
+  }
+  const maxC = d.categories[0].count;
+  catsEl.innerHTML = d.categories.map(c => `
+    <div class="cat-row">
+      <span class="cat-name" title="${esc(c.name)}">${esc(c.name)}</span>
+      <div class="cat-track"><div class="cat-fill" style="width:${Math.round(c.count/maxC*100)}%"></div></div>
+      <span class="cat-count">${c.count.toLocaleString()}</span>
+    </div>`).join('');
+
+  // Sync category filter dropdown (preserve selection)
+  const sel = document.getElementById('f-category');
+  const cur = sel.value;
+  sel.innerHTML = '<option value="">All categories</option>' +
+    d.categories.map(c => `<option value="${esc(c.name)}"${c.name===cur?' selected':''}>${esc(c.name)}</option>`).join('');
+}
+
+// ── Leads table ────────────────────────────────────────────────────────────
+function scheduleLeadLoad() {
+  clearTimeout(leadTimer);
+  leadTimer = setTimeout(() => loadLeads(1), 350);
+}
+
+async function loadLeads(page) {
+  currentPage = page || 1;
+  const params = new URLSearchParams({
+    page:        currentPage,
+    min_rating:  document.getElementById('f-rating').value,
+    min_reviews: document.getElementById('f-reviews').value,
+    has_email:   document.getElementById('f-email').checked,
+    category:    document.getElementById('f-category').value,
+  });
+
+  const res = await fetch('/api/leads?' + params);
+  const d   = await res.json();
+
+  totalPages = d.pages || 1;
+  document.getElementById('page-info').textContent = `Page ${d.page} of ${totalPages}`;
+  document.getElementById('btn-prev').disabled = d.page <= 1;
+  document.getElementById('btn-next').disabled = d.page >= totalPages;
+  document.getElementById('leads-total-lbl').textContent =
+    d.total.toLocaleString() + ' leads match filters';
+
+  const tbody = document.getElementById('leads-tbody');
+  if (!d.leads || !d.leads.length) {
+    tbody.innerHTML = '<tr><td colspan="7"><div class="empty-msg">No leads match your filters.</div></td></tr>';
+    return;
+  }
+
+  tbody.innerHTML = d.leads.map(r => `
+    <tr>
+      <td>
+        <div class="cell-name" title="${esc(r.business_name||'')}">${esc(r.business_name || '—')}</div>
+        ${r.website_url ? `<a class="cell-url" href="${esc(r.website_url)}" target="_blank" rel="noopener">${esc(trunc(r.website_url,32))}</a>` : ''}
+      </td>
+      <td style="white-space:nowrap;color:var(--muted)">${esc(r.phone||'—')}</td>
+      <td class="email-cell">${esc(r.email||'—')}</td>
+      <td style="white-space:nowrap">${r.rating ? '&#9733; ' + r.rating : '—'}</td>
+      <td>${r.review_count != null ? r.review_count.toLocaleString() : '—'}</td>
+      <td><span class="chip">${esc(r.category||'—')}</span></td>
+      <td style="color:var(--muted)">${esc(r.zip_code||'—')}</td>
+    </tr>`).join('');
+}
+
+function changePage(delta) {
+  const next = currentPage + delta;
+  if (next >= 1 && next <= totalPages) loadLeads(next);
+}
+
+// ── Export ─────────────────────────────────────────────────────────────────
+function exportCSV() {
+  const params = new URLSearchParams({
+    min_rating:  document.getElementById('f-rating').value,
+    min_reviews: document.getElementById('f-reviews').value,
+    has_email:   document.getElementById('f-email').checked,
+    category:    document.getElementById('f-category').value,
+  });
+  window.location = '/api/export?' + params;
+}
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function esc(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+function trunc(s, n) { return s && s.length > n ? s.slice(0,n) + '…' : (s || ''); }
+
+// ── Boot ───────────────────────────────────────────────────────────────────
+(async () => {
+  await refreshStats();
+  await refreshJobs();
+  await loadLeads(1);
+  ensurePolling();   // keeps stats fresh even before first job
+})();
+</script>
+</body>
+</html>
