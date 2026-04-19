@@ -363,8 +363,29 @@ def _build_where(min_rating: float, min_reviews: int, has_email: bool, category:
     return where, params
 
 
+@app.route("/api/download/<path:filename>")
+def download_file(filename: str):
+    """Serve files written to the data directory (e.g. clean_leads.csv from railway run)."""
+    import re
+    if not re.fullmatch(r"[\w\-]+\.csv", filename):
+        return jsonify({"error": "Invalid filename"}), 400
+    data_dir = Path(DB_PATH).parent
+    file_path = data_dir / filename
+    if not file_path.exists():
+        return jsonify({"error": f"{filename} not found — run clean_leads.py first"}), 404
+    return Response(
+        file_path.read_bytes(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
+    )
+
+
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     init_db()
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 5000)),
+        debug=False,
+    )
