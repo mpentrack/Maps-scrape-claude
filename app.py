@@ -339,11 +339,19 @@ def _run_job(job_id: str, api_key: str) -> None:
                     f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup, {geo} off-target).",
                 )
         if job.get("run_mode") == "full_pipeline":
-            _job_event(job_id, "info", "enrich", "Starting enrichment stage.")
-            enriched = _enrich_stage_rows(conn, "scraped", limit=None)
+            _job_event(job_id, "info", "enrich", "Starting enrichment (in-target scraped rows).")
+            e_scraped = _enrich_stage_rows(conn, "scraped", limit=None)
+            _job_event(job_id, "info", "enrich", "Starting enrichment (off-target / geo_rejected rows).")
+            e_geo = _enrich_stage_rows(conn, "geo_rejected", limit=None)
+            enriched = {
+                "checked": e_scraped["checked"] + e_geo["checked"],
+                "enriched": e_scraped["enriched"] + e_geo["enriched"],
+                "no_email": e_scraped["no_email"] + e_geo["no_email"],
+            }
             _job_event(
                 job_id, "info", "enrich",
-                f"Enrichment complete: checked={enriched['checked']}, enriched={enriched['enriched']}, no_email={enriched['no_email']}.",
+                f"Enrichment complete: checked={enriched['checked']}, enriched={enriched['enriched']}, no_email={enriched['no_email']} "
+                f"(scraped {e_scraped['checked']}, geo_rejected {e_geo['checked']}).",
             )
             _job_event(job_id, "info", "clean", "Starting cleaning stage.")
             cleaned = _clean_stage_rows(conn, "enriched", limit=None)

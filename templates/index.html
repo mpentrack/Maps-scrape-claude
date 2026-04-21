@@ -363,7 +363,7 @@
             <label class="lbl">Run Mode</label>
             <select class="form-select" id="inp-run-mode">
               <option value="scrape_only">Scrape only</option>
-              <option value="full_pipeline">Full pipeline (scrape → enrich → clean)</option>
+              <option value="full_pipeline">Full pipeline (scrape → enrich all leads incl. off-target → clean)</option>
             </select>
           </div>
 
@@ -448,7 +448,7 @@
         <div class="card-body">
           <div class="legend-grid">
             <div class="legend-item"><span class="chip">scraped</span> <b>Step 1 complete:</b> lead captured from Maps API.</div>
-            <div class="legend-item"><span class="chip">geo_rejected</span> <b>Off-target:</b> API hit for your search ZIP, but address/ZIP fields don’t match our location check (still saved so you can audit).</div>
+            <div class="legend-item"><span class="chip">geo_rejected</span> <b>Off-target:</b> API hit for your search ZIP, but address/ZIP fields don’t match our location check (still saved). On a <b>full pipeline</b> run they are enriched the same as in-target rows; you can also bulk-enrich this stage from the dashboard.</div>
             <div class="legend-item"><span class="chip">enriched</span> <b>Step 2 complete:</b> email chosen from the site with same-domain addresses first, then other business domains, then Gmail/Yahoo/Outlook-style hosts if needed. Gmail etc. are not dropped unless you turn on strict cleaning (env <code>FLAG_FREE_EMAIL_DOMAINS</code>).</div>
             <div class="legend-item"><span class="chip">enrich_failed</span> <b>Step 2 failed:</b> no usable email (reason in <code>stage_reason</code>: <code>no_email_found</code>, or <code>only_generic_email</code> when the site only lists info@/hello@ and generic inboxes are disabled).</div>
             <div class="legend-item"><span class="chip">clean</span> <b>Step 3 complete:</b> passed quality checks.</div>
