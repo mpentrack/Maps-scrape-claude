@@ -15,13 +15,12 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urljoin
 
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import formatted_address_from_item, resolve_city
+from email_extract import USER_AGENT as ENRICH_USER_AGENT, scrape_email_for_website
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
 from state_zips import STATE_NAMES, STATE_ZIPS
 
@@ -37,14 +36,21 @@ PAGE_SIZE   = 20
 MAX_PAGES   = 10
 MAX_RETRIES = 6
 JOB_WORKERS = 5   # concurrent zips per job
-ENRICH_WORKERS = 12
+ENRICH_WORKERS = int(os.environ.get("ENRICH_WORKERS", "20"))
 APPEND_ZIP_TO_QUERY = os.environ.get("APPEND_ZIP_TO_QUERY", "1").strip().lower() not in ("0", "false", "no", "off")
-EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
+# When false (default), do not store info@ / hello@ / etc. if that is all the site exposes.
+EMAIL_ALLOW_GENERIC_FALLBACK = os.environ.get("EMAIL_ALLOW_GENERIC_FALLBACK", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+# When false (default), Gmail/Yahoo/etc. stay "clean" — many small businesses use them.
+FLAG_FREE_EMAIL_DOMAINS = os.environ.get("FLAG_FREE_EMAIL_DOMAINS", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 PERSONAL_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
     "icloud.com", "me.com", "mac.com", "live.com", "msn.com", "protonmail.com", "proton.me",
+    "googlemail.com", "ymail.com",
 }
-SUBPAGES = ["/contact", "/contact-us", "/about", "/about-us"]
 DETAIL_ENDPOINTS = (
     "/place.php",
     "/place-details.php",
@@ -362,61 +368,6 @@ def _run_job(job_id: str, api_key: str) -> None:
         conn.close()
 
 
-def _normalize_url(url: str) -> str:
-    if not url:
-        return ""
-    if not url.startswith(("http://", "https://")):
-        url = "https://" + url
-    return url.rstrip("/")
-
-
-def _extract_email_candidates(html: str) -> list[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    found = []
-    for tag in soup.find_all("a", href=True):
-        href = tag["href"]
-        if href.lower().startswith("mailto:"):
-            addr = href[7:].split("?")[0].strip().lower()
-            if EMAIL_RE.fullmatch(addr):
-                found.append(addr)
-    for m in EMAIL_RE.finditer(soup.get_text(" ")):
-        found.append(m.group(0).lower())
-    dedup = []
-    seen = set()
-    for email in found:
-        if email not in seen:
-            seen.add(email)
-            dedup.append(email)
-    return dedup
-
-
-def _pick_best_email(emails: list[str]) -> str | None:
-    if not emails:
-        return None
-    non_generic = [e for e in emails if e.split("@")[0] not in {"info", "hello", "contact", "support", "sales"}]
-    return non_generic[0] if non_generic else emails[0]
-
-
-def _scrape_site_email(website_url: str) -> str | None:
-    base = _normalize_url(website_url)
-    if not base:
-        return None
-    urls = [base] + [urljoin(base + "/", p.lstrip("/")) for p in SUBPAGES]
-    all_emails = []
-    for url in urls:
-        try:
-            resp = requests.get(url, timeout=6, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
-            if resp.status_code >= 400:
-                continue
-            all_emails.extend(_extract_email_candidates(resp.text))
-            best = _pick_best_email(all_emails)
-            if best and best.split("@")[0] not in {"info", "hello", "contact", "support", "sales"}:
-                return best
-        except requests.RequestException:
-            continue
-    return _pick_best_email(all_emails)
-
-
 def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | None) -> dict:
     where = "WHERE pipeline_stage = ? AND website_url IS NOT NULL AND (email IS NULL OR email = '')"
     params = [from_stage]
@@ -435,24 +386,35 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
     def task(row):
         row_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
         website_url = row["website_url"] if isinstance(row, sqlite3.Row) else row[1]
-        return row_id, _scrape_site_email(website_url)
+        session = requests.Session()
+        session.headers.update({"User-Agent": ENRICH_USER_AGENT})
+        try:
+            res = scrape_email_for_website(
+                website_url,
+                session,
+                allow_generic_fallback=EMAIL_ALLOW_GENERIC_FALLBACK,
+            )
+            return row_id, res
+        finally:
+            session.close()
 
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as pool:
         futures = [pool.submit(task, row) for row in rows]
         for fut in as_completed(futures):
-            row_id, email = fut.result()
+            row_id, res = fut.result()
             now = datetime.utcnow().isoformat()
-            if email:
+            if res.email:
                 conn.execute(
                     "UPDATE businesses SET email=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=? WHERE id=?",
-                    (email, now, row_id),
+                    (res.email, now, row_id),
                 )
                 with result_lock:
                     enriched += 1
             else:
+                reason = res.stage_reason or "no_email_found"
                 conn.execute(
-                    "UPDATE businesses SET pipeline_stage='enrich_failed', stage_reason='no_email_found', enriched_at=? WHERE id=?",
-                    (now, row_id),
+                    "UPDATE businesses SET pipeline_stage='enrich_failed', stage_reason=?, enriched_at=? WHERE id=?",
+                    (reason, now, row_id),
                 )
                 with result_lock:
                     no_email += 1
@@ -466,7 +428,7 @@ def _classify_clean_stage(row: sqlite3.Row) -> tuple[str, str | None]:
     review_count = row["review_count"]
     if not email:
         return "clean_failed", "missing_email"
-    if email.split("@")[-1] in PERSONAL_DOMAINS:
+    if FLAG_FREE_EMAIL_DOMAINS and email.split("@")[-1] in PERSONAL_DOMAINS:
         return "flagged", "personal_email_domain"
     if "permanently closed" in name:
         return "flagged", "permanently_closed"
