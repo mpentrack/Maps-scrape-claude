@@ -302,11 +302,12 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
             "limit": PAGE_SIZE,
             "offset": (page - 1) * PAGE_SIZE,
             "language": "en",
-            "lang": "en",
-            "zoom": 12,
         }
         if coords:
-            params["lat"], params["lng"] = coords[0], coords[1]
+            params["lat"] = coords[0]
+            params["lng"] = coords[1]
+            if coords.exact:
+                params["zoom"] = 13
         data = _get_with_backoff(f"{API_BASE}/searchmaps.php", params, api_key)
 
         if data is None:

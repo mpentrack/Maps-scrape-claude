@@ -323,11 +323,12 @@ def _scrape_zip(
             "limit": PAGE_SIZE,
             "offset": (page - 1) * PAGE_SIZE,
             "language": "en",
-            "lang": "en",
-            "zoom": 12,
         }
         if coords:
-            params["lat"], params["lng"] = coords[0], coords[1]
+            params["lat"] = coords[0]
+            params["lng"] = coords[1]
+            if coords.exact:
+                params["zoom"] = 13
         data = _api_get(
             f"{API_BASE}/searchmaps.php",
             params,
