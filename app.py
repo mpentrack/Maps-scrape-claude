@@ -46,10 +46,11 @@ EMAIL_ALLOW_GENERIC_FALLBACK = os.environ.get("EMAIL_ALLOW_GENERIC_FALLBACK", "0
 FLAG_FREE_EMAIL_DOMAINS = os.environ.get("FLAG_FREE_EMAIL_DOMAINS", "0").strip().lower() in (
     "1", "true", "yes", "on",
 )
+# Used only when FLAG_FREE_EMAIL_DOMAINS=1 — keep in sync with email_extract.FREE_EMAIL_PROVIDER_DOMAINS
 PERSONAL_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
     "icloud.com", "me.com", "mac.com", "live.com", "msn.com", "protonmail.com", "proton.me",
-    "googlemail.com", "ymail.com",
+    "googlemail.com", "ymail.com", "gmx.com", "gmx.net", "mail.com", "zoho.com",
 }
 DETAIL_ENDPOINTS = (
     "/place.php",

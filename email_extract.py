@@ -10,7 +10,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote, urljoin
+from urllib.parse import unquote, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -54,6 +54,14 @@ class EmailScrapeResult:
     """When email is None: 'no_email_found' or 'only_generic_email'."""
 
 
+# Consumer / free-mail hosts — kept as candidates but ranked below same-site addresses.
+FREE_EMAIL_PROVIDER_DOMAINS: frozenset[str] = frozenset({
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
+    "icloud.com", "me.com", "mac.com", "live.com", "msn.com",
+    "protonmail.com", "proton.me", "googlemail.com", "ymail.com",
+    "gmx.com", "gmx.net", "mail.com", "zoho.com",
+})
+
 # Domains that are almost never real mailbox hosts in scraped HTML.
 _JUNK_EMAIL_DOMAIN_SUFFIXES = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
@@ -84,15 +92,89 @@ def is_plausible_email(email: str) -> bool:
     return not dom.endswith(_JUNK_EMAIL_DOMAIN_SUFFIXES)
 
 
-def pick_best_email(emails: list[str], *, allow_generic_fallback: bool) -> str | None:
+def _site_host_for_match(website_url: str) -> str:
+    """Hostname used for same-site email preference (no scheme/path, no leading www.)."""
+    if not (website_url or "").strip():
+        return ""
+    try:
+        host = (urlparse(normalize_website_url(website_url)).hostname or "").lower()
+    except ValueError:
+        return ""
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def email_domain_matches_site(email: str, site_host: str) -> bool:
+    """True if the mailbox domain is the site host or a plausible parent/child match."""
+    if not site_host:
+        return False
+    dom = email.split("@")[-1].lower()
+    if dom == site_host:
+        return True
+    if dom.endswith("." + site_host) and len(dom) > len(site_host):
+        return True
+    if site_host.endswith("." + dom) and len(site_host) > len(dom):
+        return True
+    return False
+
+
+def is_free_email_provider(email: str) -> bool:
+    return email.split("@")[-1].lower() in FREE_EMAIL_PROVIDER_DOMAINS
+
+
+def _email_priority_tier(email: str, site_host: str) -> int:
+    """
+    Lower = better. Same-site always beats off-site; free-mail hosts sink below
+    corporate domains unless the address is on the business's own domain.
+    """
+    gen = is_generic_email(email)
+    on_site = email_domain_matches_site(email, site_host)
+    free = is_free_email_provider(email)
+    if not gen and on_site:
+        return 0
+    if gen and on_site:
+        return 1
+    if not gen and not free:
+        return 2
+    if not gen and free:
+        return 3
+    if gen and not free:
+        return 4
+    return 5
+
+
+def pick_best_email(
+    emails: list[str],
+    *,
+    allow_generic_fallback: bool,
+    website_url: str | None = None,
+) -> str | None:
     if not emails:
         return None
-    filtered = [e for e in emails if is_plausible_email(e)]
-    non_generic = [e for e in filtered if not is_generic_email(e)]
-    if non_generic:
-        return non_generic[0]
-    if allow_generic_fallback and filtered:
-        return filtered[0]
+    site_host = _site_host_for_match(website_url or "")
+
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for e in emails:
+        e = e.strip().lower()
+        if not e or e in seen or not is_plausible_email(e):
+            continue
+        seen.add(e)
+        ordered.append(e)
+    if not ordered:
+        return None
+
+    usable = [e for e in ordered if allow_generic_fallback or not is_generic_email(e)]
+    if not usable:
+        return None
+
+    best_tier = min(_email_priority_tier(e, site_host) for e in usable)
+    for e in ordered:
+        if e not in usable:
+            continue
+        if _email_priority_tier(e, site_host) == best_tier:
+            return e
     return None
 
 
@@ -198,10 +280,18 @@ def scrape_email_for_website(
             continue
         any_page_loaded = True
         all_emails.extend(extract_email_candidates(html))
-        best = pick_best_email(all_emails, allow_generic_fallback=allow_generic_fallback)
+        best = pick_best_email(
+            all_emails,
+            allow_generic_fallback=allow_generic_fallback,
+            website_url=website_url,
+        )
         if best and (allow_generic_fallback or not is_generic_email(best)):
             return EmailScrapeResult(best, None)
-    best = pick_best_email(all_emails, allow_generic_fallback=allow_generic_fallback)
+    best = pick_best_email(
+        all_emails,
+        allow_generic_fallback=allow_generic_fallback,
+        website_url=website_url,
+    )
     if best:
         return EmailScrapeResult(best, None)
     if not any_page_loaded:
