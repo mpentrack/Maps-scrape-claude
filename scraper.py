@@ -32,6 +32,7 @@ PAGE_SIZE = 20          # results per page (API default)
 MAX_PAGES = 10          # safety cap per zip
 BACKOFF_BASE = 1.0      # seconds; doubles each retry
 MAX_RETRIES = 6
+APPEND_ZIP_TO_QUERY = os.environ.get("APPEND_ZIP_TO_QUERY", "1").strip().lower() not in ("0", "false", "no", "off")
 DETAIL_ENDPOINTS = (
     "/place.php",
     "/place-details.php",
@@ -174,6 +175,16 @@ def _get_with_backoff(url: str, params: dict, api_key: str) -> dict | None:
     return None
 
 
+def _query_for_zip(keyword: str, zip_code: str) -> str:
+    q = (keyword or "").strip()
+    z = (zip_code or "").strip()
+    if not z or not APPEND_ZIP_TO_QUERY:
+        return q
+    if z in q:
+        return q
+    return f"{q} {z}".strip()
+
+
 # ---------------------------------------------------------------------------
 # Parsing
 # ---------------------------------------------------------------------------
@@ -268,10 +279,11 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
     """Return (inserted, skipped, geo_rejected) counts for one zip code."""
     inserted = skipped = geo_rejected = 0
     details_cache: dict[str, dict | None] = {}
+    query = _query_for_zip(keyword, zip_code)
 
     for page in range(1, MAX_PAGES + 1):
         params = {
-            "query": keyword,
+            "query": query,
             "zipcode": zip_code,
             "country": "us",
             "limit": PAGE_SIZE,

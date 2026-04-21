@@ -38,6 +38,7 @@ MAX_PAGES   = 10
 MAX_RETRIES = 6
 JOB_WORKERS = 5   # concurrent zips per job
 ENRICH_WORKERS = 12
+APPEND_ZIP_TO_QUERY = os.environ.get("APPEND_ZIP_TO_QUERY", "1").strip().lower() not in ("0", "false", "no", "off")
 EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
 PERSONAL_DOMAINS = {
     "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
@@ -138,6 +139,16 @@ def _api_get(url: str, params: dict, api_key: str):
             time.sleep(delay)
             delay *= 2
     return None
+
+
+def _query_for_zip(keyword: str, zip_code: str) -> str:
+    q = (keyword or "").strip()
+    z = (zip_code or "").strip()
+    if not z or not APPEND_ZIP_TO_QUERY:
+        return q
+    if z in q:
+        return q
+    return f"{q} {z}".strip()
 
 
 def _parse(item: dict, zip_code: str) -> dict:
@@ -255,10 +266,11 @@ def _scrape_zip(zip_code: str, keyword: str, api_key: str,
                 conn: sqlite3.Connection, lock: threading.Lock) -> tuple[int, int, int]:
     inserted = skipped = geo_rejected = 0
     details_cache: dict[str, dict | None] = {}
+    query = _query_for_zip(keyword, zip_code)
     for page in range(1, MAX_PAGES + 1):
         data = _api_get(
             f"{API_BASE}/searchmaps.php",
-            {"query": keyword, "zipcode": zip_code, "country": "us",
+            {"query": query, "zipcode": zip_code, "country": "us",
              "limit": PAGE_SIZE, "offset": (page - 1) * PAGE_SIZE, "language": "en"},
             api_key,
         )
