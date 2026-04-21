@@ -17,7 +17,7 @@ from threading import Lock
 import requests
 
 from city_parse import resolve_city
-from geo_zip import row_passes_search_zip_filter
+from geo_zip import listing_matches_search_zip
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -209,7 +209,7 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
 
         for item in results:
             row = _parse_result(item, zip_code)
-            if not row_passes_search_zip_filter(row.get("address"), zip_code):
+            if not listing_matches_search_zip(item, row.get("address"), zip_code):
                 geo_rejected += 1
                 continue
             if insert_business(conn, row):

@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import resolve_city
-from geo_zip import row_passes_search_zip_filter
+from geo_zip import listing_matches_search_zip
 from state_zips import STATE_NAMES, STATE_ZIPS
 
 app = Flask(__name__)
@@ -191,7 +191,7 @@ def _scrape_zip(zip_code: str, keyword: str, api_key: str,
             break
         for item in results:
             row = _parse(item, zip_code)
-            if not row_passes_search_zip_filter(row.get("address"), zip_code):
+            if not listing_matches_search_zip(item, row.get("address"), zip_code):
                 geo_rejected += 1
                 continue
             if _insert(conn, lock, row):
