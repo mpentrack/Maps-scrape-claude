@@ -8,6 +8,7 @@ Usage:
 import argparse
 import csv
 import logging
+import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,7 +18,7 @@ from threading import Lock
 import requests
 
 from city_parse import formatted_address_from_item, resolve_city
-from geo_zip import listing_matches_search_zip
+from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -63,6 +64,7 @@ def init_db(path: str) -> sqlite3.Connection:
             review_count INTEGER,
             category     TEXT,
             zip_code     TEXT,
+            search_zip   TEXT,
             pipeline_stage TEXT DEFAULT 'scraped',
             stage_reason TEXT,
             created_at   TEXT DEFAULT (datetime('now'))
@@ -71,6 +73,7 @@ def init_db(path: str) -> sqlite3.Connection:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
     for col, ddl in [
         ("city", "ALTER TABLE businesses ADD COLUMN city TEXT"),
+        ("search_zip", "ALTER TABLE businesses ADD COLUMN search_zip TEXT"),
         ("pipeline_stage", "ALTER TABLE businesses ADD COLUMN pipeline_stage TEXT DEFAULT 'scraped'"),
         ("stage_reason", "ALTER TABLE businesses ADD COLUMN stage_reason TEXT"),
     ]:
@@ -109,8 +112,8 @@ def insert_business(
                 """
                 INSERT INTO businesses
                     (business_name, address, city, phone, website_url,
-                     rating, review_count, category, zip_code, pipeline_stage, stage_reason)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                     rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     row.get("business_name"),
@@ -122,6 +125,7 @@ def insert_business(
                     row.get("review_count"),
                     row.get("category"),
                     row.get("zip_code"),
+                    row.get("search_zip"),
                     pipeline_stage,
                     stage_reason,
                 ),
@@ -183,6 +187,7 @@ def _parse_result(item: dict, zip_code: str) -> dict:
         else:
             address = raw_addr if isinstance(raw_addr, str) else None
     city = resolve_city(item, address, zip_code)
+    listing_zip = best_listing_zip(item, address)
     return {
         "business_name": item.get("name") or item.get("title"),
         "address":       address,
@@ -192,7 +197,8 @@ def _parse_result(item: dict, zip_code: str) -> dict:
         "rating":        item.get("rating"),
         "review_count":  item.get("reviews") or item.get("review_count"),
         "category":      (item.get("types") or [""])[0] if isinstance(item.get("types"), list) else item.get("type") or item.get("category"),
-        "zip_code":      zip_code,
+        "zip_code":      listing_zip,
+        "search_zip":    normalize_zip5(zip_code),
     }
 
 
@@ -291,7 +297,13 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
         for item in results:
             row = _parse_result(item, zip_code)
             item_for_match = _hydrate_row_location(row, item, zip_code, api_key, details_cache)
-            if not listing_matches_search_zip(item_for_match, row.get("address"), zip_code):
+            row["zip_code"] = best_listing_zip(item_for_match, row.get("address"))
+            expected_zip = normalize_zip5(zip_code)
+            strict_exact = os.environ.get("STRICT_EXACT_ZIP", "1").strip().lower() not in ("0", "false", "no", "off")
+            exact_ok = bool(row.get("zip_code") and expected_zip and row["zip_code"] == expected_zip)
+            geo_ok = listing_matches_search_zip(item_for_match, row.get("address"), zip_code)
+            accept = exact_ok if strict_exact else geo_ok
+            if not accept:
                 if insert_business(conn, row, "geo_rejected", "geo_zip_mismatch"):
                     geo_rejected += 1
                 else:

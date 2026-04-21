@@ -68,6 +68,20 @@ def extract_zip5s_from_item_and_address(item: dict[str, Any], formatted_address:
     return found
 
 
+def best_listing_zip(item: dict[str, Any] | Any, formatted_address: str | None) -> str | None:
+    """Best-effort real listing ZIP from payload fields, then address text."""
+    row: dict[str, Any] = item if isinstance(item, dict) else {}
+    for s in _collect_postal_strings(row):
+        z = normalize_zip5(s)
+        if z:
+            return z
+    if formatted_address:
+        m = _ZIP_IN_TEXT.search(str(formatted_address))
+        if m:
+            return m.group(1).zfill(5)
+    return None
+
+
 def formatted_address_contains_search_zip(address: str | None, search_zip: str) -> bool:
     """True if address contains the 5-digit search ZIP as its own token (allows ZIP+4)."""
     target = normalize_zip5(search_zip)

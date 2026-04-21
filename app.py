@@ -22,7 +22,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import formatted_address_from_item, resolve_city
-from geo_zip import listing_matches_search_zip
+from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
 from state_zips import STATE_NAMES, STATE_ZIPS
 
 app = Flask(__name__)
@@ -79,6 +79,7 @@ def init_db() -> None:
             review_count  INTEGER,
             category      TEXT,
             zip_code      TEXT,
+            search_zip    TEXT,
             city          TEXT,
             created_at    TEXT DEFAULT (datetime('now')),
             pipeline_stage TEXT DEFAULT 'scraped',
@@ -98,6 +99,7 @@ def init_db() -> None:
     for col, ddl in {
         "email": "ALTER TABLE businesses ADD COLUMN email TEXT",
         "city": "ALTER TABLE businesses ADD COLUMN city TEXT",
+        "search_zip": "ALTER TABLE businesses ADD COLUMN search_zip TEXT",
         "pipeline_stage": "ALTER TABLE businesses ADD COLUMN pipeline_stage TEXT DEFAULT 'scraped'",
         "stage_reason": "ALTER TABLE businesses ADD COLUMN stage_reason TEXT",
         "enriched_at": "ALTER TABLE businesses ADD COLUMN enriched_at TEXT",
@@ -149,6 +151,7 @@ def _parse(item: dict, zip_code: str) -> dict:
         else:
             address = raw_addr if isinstance(raw_addr, str) else None
     city = resolve_city(item, address, zip_code)
+    listing_zip = best_listing_zip(item, address)
     return {
         "business_name": item.get("name") or item.get("title"),
         "address":       address,
@@ -158,7 +161,8 @@ def _parse(item: dict, zip_code: str) -> dict:
         "rating":        item.get("rating"),
         "review_count":  item.get("reviews") or item.get("review_count"),
         "category":      category,
-        "zip_code":      zip_code,
+        "zip_code":      listing_zip,
+        "search_zip":    normalize_zip5(zip_code),
     }
 
 
@@ -235,10 +239,10 @@ def _insert(
         try:
             conn.execute(
                 "INSERT INTO businesses "
-                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, pipeline_stage, stage_reason) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row["business_name"], row["address"], row.get("city"), phone, url,
-                 row["rating"], row["review_count"], row["category"], row["zip_code"],
+                 row["rating"], row["review_count"], row["category"], row["zip_code"], row.get("search_zip"),
                  pipeline_stage, stage_reason),
             )
             conn.commit()
@@ -266,7 +270,13 @@ def _scrape_zip(zip_code: str, keyword: str, api_key: str,
         for item in results:
             row = _parse(item, zip_code)
             item_for_match = _hydrate_row_location(row, item, zip_code, api_key, details_cache)
-            if not listing_matches_search_zip(item_for_match, row.get("address"), zip_code):
+            row["zip_code"] = best_listing_zip(item_for_match, row.get("address"))
+            expected_zip = normalize_zip5(zip_code)
+            strict_exact = os.environ.get("STRICT_EXACT_ZIP", "1").strip().lower() not in ("0", "false", "no", "off")
+            exact_ok = bool(row.get("zip_code") and expected_zip and row["zip_code"] == expected_zip)
+            geo_ok = listing_matches_search_zip(item_for_match, row.get("address"), zip_code)
+            accept = exact_ok if strict_exact else geo_ok
+            if not accept:
                 if _insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch"):
                     geo_rejected += 1
                 else:
@@ -669,7 +679,7 @@ def export():
     conn = get_conn()
     rows = conn.execute(
         f"SELECT business_name, address, city, phone, website_url, email, "
-        f"rating, review_count, category, zip_code, pipeline_stage, stage_reason "
+        f"rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason "
         f"FROM businesses {where} ORDER BY id DESC",
         params,
     ).fetchall()
@@ -679,7 +689,7 @@ def export():
         buf = io.StringIO()
         w   = csv.writer(buf)
         w.writerow(["business_name","address","city","phone","website_url","email",
-                    "rating","review_count","category","zip_code","pipeline_stage","stage_reason"])
+                    "rating","review_count","category","zip_code","search_zip","pipeline_stage","stage_reason"])
         for row in rows:
             w.writerow(list(row))
         yield buf.getvalue()
