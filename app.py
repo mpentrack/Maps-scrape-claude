@@ -22,6 +22,7 @@ from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import resolve_city
+from geo_zip import row_passes_search_zip_filter
 from state_zips import STATE_NAMES, STATE_ZIPS
 
 app = Flask(__name__)
@@ -174,8 +175,8 @@ def _insert(conn: sqlite3.Connection, lock: threading.Lock, row: dict) -> bool:
 
 
 def _scrape_zip(zip_code: str, keyword: str, api_key: str,
-                conn: sqlite3.Connection, lock: threading.Lock) -> tuple[int, int]:
-    inserted = skipped = 0
+                conn: sqlite3.Connection, lock: threading.Lock) -> tuple[int, int, int]:
+    inserted = skipped = geo_rejected = 0
     for page in range(1, MAX_PAGES + 1):
         data = _api_get(
             f"{API_BASE}/searchmaps.php",
@@ -189,13 +190,17 @@ def _scrape_zip(zip_code: str, keyword: str, api_key: str,
         if not results:
             break
         for item in results:
-            if _insert(conn, lock, _parse(item, zip_code)):
+            row = _parse(item, zip_code)
+            if not row_passes_search_zip_filter(row.get("address"), zip_code):
+                geo_rejected += 1
+                continue
+            if _insert(conn, lock, row):
                 inserted += 1
             else:
                 skipped += 1
         if len(results) < PAGE_SIZE:
             break
-    return inserted, skipped
+    return inserted, skipped, geo_rejected
 
 
 def _run_job(job_id: str, api_key: str) -> None:
@@ -216,12 +221,16 @@ def _run_job(job_id: str, api_key: str) -> None:
                 for z in job["zip_codes"]
             }
             for future in as_completed(futures):
-                ins, skp = future.result()
+                ins, skp, geo = future.result()
                 with _jobs_lock:
-                    job["inserted"]   += ins
-                    job["duplicates"] += skp
-                    job["processed"]  += 1
-                _job_event(job_id, "info", "scrape", f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup).")
+                    job["inserted"]      += ins
+                    job["duplicates"]    += skp
+                    job["geo_rejected"]  = job.get("geo_rejected", 0) + geo
+                    job["processed"]     += 1
+                _job_event(
+                    job_id, "info", "scrape",
+                    f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup, {geo} off-target).",
+                )
         if job.get("run_mode") == "full_pipeline":
             _job_event(job_id, "info", "enrich", "Starting enrichment stage.")
             enriched = _enrich_stage_rows(conn, "scraped", limit=None)
@@ -480,6 +489,7 @@ def start_job():
         "processed":    0,
         "inserted":     0,
         "duplicates":   0,
+        "geo_rejected": 0,
         "started_at":   datetime.utcnow().isoformat(),
         "completed_at": None,
         "error":        None,

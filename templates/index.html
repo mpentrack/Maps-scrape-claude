@@ -642,6 +642,7 @@ async function refreshJobs() {
           <span>${j.processed}/${j.total} zips</span>
           <span style="color:var(--green)">+${j.inserted.toLocaleString()} new</span>
           <span>${j.duplicates.toLocaleString()} dup</span>
+          ${(j.geo_rejected != null && j.geo_rejected > 0) ? `<span style="color:var(--orange)">${j.geo_rejected.toLocaleString()} off-target</span>` : ''}
           ${j.enriched ? `<span>enriched ${j.enriched.enriched || 0}/${j.enriched.checked || 0}</span>` : ''}
           ${j.cleaned ? `<span>clean ${j.cleaned.clean || 0}/${j.cleaned.checked || 0}</span>` : ''}
           <span style="margin-left:auto">${pct}%</span>

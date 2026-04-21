@@ -17,6 +17,7 @@ from threading import Lock
 import requests
 
 from city_parse import resolve_city
+from geo_zip import row_passes_search_zip_filter
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -177,9 +178,9 @@ def _parse_result(item: dict, zip_code: str) -> dict:
 # Per-zip scrape
 # ---------------------------------------------------------------------------
 
-def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connection) -> tuple[int, int]:
-    """Return (inserted, skipped) counts for one zip code."""
-    inserted = skipped = 0
+def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connection) -> tuple[int, int, int]:
+    """Return (inserted, skipped, geo_rejected) counts for one zip code."""
+    inserted = skipped = geo_rejected = 0
 
     for page in range(1, MAX_PAGES + 1):
         params = {
@@ -208,17 +209,23 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
 
         for item in results:
             row = _parse_result(item, zip_code)
+            if not row_passes_search_zip_filter(row.get("address"), zip_code):
+                geo_rejected += 1
+                continue
             if insert_business(conn, row):
                 inserted += 1
             else:
                 skipped += 1
 
-        log.info("ZIP %-10s page %2d — +%d new, %d dup", zip_code, page, inserted, skipped)
+        log.info(
+            "ZIP %-10s page %2d — +%d new, %d dup, %d off-target",
+            zip_code, page, inserted, skipped, geo_rejected,
+        )
 
         if len(results) < PAGE_SIZE:
             break  # last page
 
-    return inserted, skipped
+    return inserted, skipped, geo_rejected
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +260,7 @@ def main():
     zips = load_zips(args.csv)
     log.info("Loaded %d zip codes. Keyword: '%s'", len(zips), args.keyword)
 
-    total_inserted = total_skipped = 0
+    total_inserted = total_skipped = total_geo = 0
     lock = Lock()
 
     def task(zip_code):
@@ -264,14 +271,18 @@ def main():
         for future in as_completed(futures):
             z = futures[future]
             try:
-                _, (ins, skp) = future.result()
+                _, (ins, skp, geo) = future.result()
                 with lock:
                     total_inserted += ins
                     total_skipped  += skp
+                    total_geo      += geo
             except Exception as exc:
                 log.error("ZIP %s failed: %s", z, exc)
 
-    log.info("Done. Total inserted: %d | duplicates skipped: %d | DB: %s", total_inserted, total_skipped, args.db)
+    log.info(
+        "Done. Total inserted: %d | duplicates skipped: %d | off-target skipped: %d | DB: %s",
+        total_inserted, total_skipped, total_geo, args.db,
+    )
     conn.close()
 
 
