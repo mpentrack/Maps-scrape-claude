@@ -21,6 +21,7 @@ from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import formatted_address_from_item, resolve_city
 from email_extract import USER_AGENT as ENRICH_USER_AGENT, scrape_email_for_website
+from maps_item import contact_fields_from_maps_item, iter_search_results
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
 from state_zips import STATE_NAMES, STATE_ZIPS
 
@@ -129,22 +130,41 @@ def init_db() -> None:
 
 # ── Scraping helpers (self-contained so app.py has no import coupling) ────────
 
-def _api_get(url: str, params: dict, api_key: str):
+def _api_get(
+    url: str,
+    params: dict,
+    api_key: str,
+    *,
+    log_context: str = "",
+) -> dict | list | None:
     headers = {"x-rapidapi-host": API_HOST, "x-rapidapi-key": api_key}
     delay = 1.0
+    ctx = f" {log_context}" if log_context else ""
     for _ in range(MAX_RETRIES):
         try:
             resp = requests.get(url, headers=headers, params=params, timeout=30)
             if resp.status_code == 200:
-                return resp.json()
+                try:
+                    return resp.json()
+                except ValueError:
+                    log.warning("Maps API non-JSON 200%s: %s", ctx, resp.text[:300])
+                    return None
             if resp.status_code == 429:
                 time.sleep(delay)
                 delay *= 2
                 continue
+            log.warning(
+                "Maps API HTTP %s%s — %s",
+                resp.status_code,
+                ctx,
+                (resp.text or "")[:500],
+            )
             return None
-        except requests.RequestException:
+        except requests.RequestException as exc:
+            log.warning("Maps API request error%s: %s", ctx, exc)
             time.sleep(delay)
             delay *= 2
+    log.error("Maps API gave up after retries%s", ctx)
     return None
 
 
@@ -159,6 +179,7 @@ def _query_for_zip(keyword: str, zip_code: str) -> str:
 
 
 def _parse(item: dict, zip_code: str) -> dict:
+    phone, website = contact_fields_from_maps_item(item)
     types = item.get("types")
     category = types[0] if isinstance(types, list) and types else item.get("type") or item.get("category")
     address = formatted_address_from_item(item)
@@ -174,8 +195,8 @@ def _parse(item: dict, zip_code: str) -> dict:
         "business_name": item.get("name") or item.get("title"),
         "address":       address,
         "city":          city,
-        "phone":         item.get("phone_number") or item.get("phone"),
-        "website_url":   item.get("website"),
+        "phone":         phone or item.get("phone_number") or item.get("phone"),
+        "website_url":   website or item.get("website"),
         "rating":        item.get("rating"),
         "review_count":  item.get("reviews") or item.get("review_count"),
         "category":      category,
@@ -217,7 +238,7 @@ def _fetch_place_details(place_token: str, api_key: str, cache: dict[str, dict |
             {"google_id": place_token, "language": "en"},
             {"cid": place_token, "language": "en"},
         ):
-            data = _api_get(f"{API_BASE}{ep}", params, api_key)
+            data = _api_get(f"{API_BASE}{ep}", params, api_key, log_context="place-detail")
             payload = _first_dict_payload(data)
             if isinstance(payload, dict) and payload:
                 cache[place_token] = payload
@@ -269,8 +290,14 @@ def _insert(
             return False
 
 
-def _scrape_zip(zip_code: str, keyword: str, api_key: str,
-                conn: sqlite3.Connection, lock: threading.Lock) -> tuple[int, int, int]:
+def _scrape_zip(
+    zip_code: str,
+    keyword: str,
+    api_key: str,
+    conn: sqlite3.Connection,
+    lock: threading.Lock,
+    job_id: str | None = None,
+) -> tuple[int, int, int]:
     inserted = skipped = geo_rejected = 0
     details_cache: dict[str, dict | None] = {}
     query = _query_for_zip(keyword, zip_code)
@@ -280,11 +307,25 @@ def _scrape_zip(zip_code: str, keyword: str, api_key: str,
             {"query": query, "zipcode": zip_code, "country": "us",
              "limit": PAGE_SIZE, "offset": (page - 1) * PAGE_SIZE, "language": "en"},
             api_key,
+            log_context=f"searchmaps zip={zip_code} page={page} query={query!r}",
         )
         if not data:
+            msg = f"searchmaps returned no JSON for zip {zip_code} page {page} (check API key and RapidAPI subscription)."
+            log.warning(msg)
+            if job_id:
+                _job_event(job_id, "warning", "scrape", msg)
             break
-        results = data.get("data") or data.get("results") or data.get("businesses") or []
+        results = iter_search_results(data)
         if not results:
+            keys = list(data.keys())[:24] if isinstance(data, dict) else [type(data).__name__]
+            snippet = str(data)[:400] if isinstance(data, dict) else repr(data)[:200]
+            msg = (
+                f"No business list in API response for zip {zip_code} page {page}. "
+                f"top-level keys={keys!r} snippet={snippet!r}"
+            )
+            log.warning(msg)
+            if job_id:
+                _job_event(job_id, "warning", "scrape", msg)
             break
         for item in results:
             row = _parse(item, zip_code)
@@ -324,7 +365,7 @@ def _run_job(job_id: str, api_key: str) -> None:
     try:
         with ThreadPoolExecutor(max_workers=JOB_WORKERS) as pool:
             futures = {
-                pool.submit(_scrape_zip, z, job["keyword"], api_key, conn, lock): z
+                pool.submit(_scrape_zip, z, job["keyword"], api_key, conn, lock, job_id): z
                 for z in job["zip_codes"]
             }
             for future in as_completed(futures):

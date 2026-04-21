@@ -19,6 +19,7 @@ import requests
 
 from city_parse import formatted_address_from_item, resolve_city
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
+from maps_item import contact_fields_from_maps_item, iter_search_results
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -159,13 +160,17 @@ def _get_with_backoff(url: str, params: dict, api_key: str) -> dict | None:
                 timeout=30,
             )
             if resp.status_code == 200:
-                return resp.json()
+                try:
+                    return resp.json()
+                except ValueError:
+                    log.warning("Non-JSON 200 from %s: %s", url, resp.text[:300])
+                    return None
             if resp.status_code == 429:
                 log.warning("Rate-limited (429). Waiting %.1fs (attempt %d/%d).", delay, attempt, MAX_RETRIES)
                 time.sleep(delay)
                 delay *= 2
                 continue
-            log.error("HTTP %s for %s — skipping.", resp.status_code, url)
+            log.error("HTTP %s for %s — %s", resp.status_code, url, (resp.text or "")[:500])
             return None
         except requests.RequestException as exc:
             log.warning("Request error: %s. Waiting %.1fs.", exc, delay)
@@ -190,6 +195,7 @@ def _query_for_zip(keyword: str, zip_code: str) -> str:
 # ---------------------------------------------------------------------------
 
 def _parse_result(item: dict, zip_code: str) -> dict:
+    phone, website = contact_fields_from_maps_item(item)
     address = formatted_address_from_item(item)
     if not address:
         raw_addr = item.get("full_address") or item.get("address")
@@ -203,8 +209,8 @@ def _parse_result(item: dict, zip_code: str) -> dict:
         "business_name": item.get("name") or item.get("title"),
         "address":       address,
         "city":          city,
-        "phone":         item.get("phone_number") or item.get("phone"),
-        "website_url":   item.get("website"),
+        "phone":         phone or item.get("phone_number") or item.get("phone"),
+        "website_url":   website or item.get("website"),
         "rating":        item.get("rating"),
         "review_count":  item.get("reviews") or item.get("review_count"),
         "category":      (item.get("types") or [""])[0] if isinstance(item.get("types"), list) else item.get("type") or item.get("category"),
@@ -295,15 +301,14 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
         if data is None:
             break
 
-        # The API may return results under different keys depending on version
-        results = (
-            data.get("data")
-            or data.get("results")
-            or data.get("businesses")
-            or []
-        )
-
+        results = iter_search_results(data)
         if not results:
+            log.warning(
+                "No business list in search response zip=%s page=%d keys=%s",
+                zip_code,
+                page,
+                list(data.keys())[:24] if isinstance(data, dict) else type(data).__name__,
+            )
             break
 
         for item in results:
