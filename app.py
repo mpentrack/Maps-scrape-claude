@@ -346,8 +346,27 @@ def _scrape_zip(
                 inserted += 1
             else:
                 skipped += 1
+        log.info(
+            "[scrape-job %s] zip=%s page=%d api_rows=%d cumulative new=%d dup=%d off_target=%d query=%r",
+            job_id or "-",
+            zip_code,
+            page,
+            len(results),
+            inserted,
+            skipped,
+            geo_rejected,
+            query,
+        )
         if len(results) < PAGE_SIZE:
             break
+    log.info(
+        "[scrape-job %s] zip=%s finished cumulative new=%d dup=%d off_target=%d",
+        job_id or "-",
+        zip_code,
+        inserted,
+        skipped,
+        geo_rejected,
+    )
     return inserted, skipped, geo_rejected
 
 
@@ -356,6 +375,15 @@ def _run_job(job_id: str, api_key: str) -> None:
         job = _jobs[job_id]
         job["status"] = "running"
     _job_event(job_id, "info", "scrape", "Job started.")
+    with _jobs_lock:
+        j = _jobs[job_id]
+    log.info(
+        "[scrape-job %s] started keyword=%r zip_count=%d mode=%s",
+        job_id,
+        j.get("keyword"),
+        len(j.get("zip_codes") or []),
+        j.get("run_mode", "scrape_only"),
+    )
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
@@ -405,6 +433,15 @@ def _run_job(job_id: str, api_key: str) -> None:
                 job["cleaned"] = cleaned
         with _jobs_lock:
             job["status"] = "completed"
+            fin = dict(job)
+        log.info(
+            "[scrape-job %s] completed new=%d dup=%d off_target=%d mode=%s",
+            job_id,
+            fin.get("inserted", 0),
+            fin.get("duplicates", 0),
+            fin.get("geo_rejected", 0),
+            fin.get("run_mode", "scrape_only"),
+        )
         _job_event(job_id, "info", "job", "Job completed.")
     except Exception as exc:
         log.exception("Job %s failed", job_id)
