@@ -5,6 +5,7 @@ Run: python app.py  →  http://localhost:5000
 
 import csv
 import io
+import logging
 import os
 import re
 import sqlite3
@@ -23,6 +24,8 @@ from flask import Flask, Response, jsonify, render_template, request
 from state_zips import STATE_NAMES, STATE_ZIPS
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 DB_PATH     = os.environ.get("DB_PATH", "businesses.db")
@@ -43,6 +46,7 @@ SUBPAGES = ["/contact", "/contact-us", "/about", "/about-us"]
 # ── In-memory job store ───────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+MAX_JOB_EVENTS = 200
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -180,8 +184,10 @@ def _run_job(job_id: str, api_key: str) -> None:
     with _jobs_lock:
         job = _jobs[job_id]
         job["status"] = "running"
+    _job_event(job_id, "info", "scrape", "Job started.")
 
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     lock = threading.Lock()
 
@@ -197,18 +203,32 @@ def _run_job(job_id: str, api_key: str) -> None:
                     job["inserted"]   += ins
                     job["duplicates"] += skp
                     job["processed"]  += 1
+                _job_event(job_id, "info", "scrape", f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup).")
         if job.get("run_mode") == "full_pipeline":
+            _job_event(job_id, "info", "enrich", "Starting enrichment stage.")
             enriched = _enrich_stage_rows(conn, "scraped", limit=None)
+            _job_event(
+                job_id, "info", "enrich",
+                f"Enrichment complete: checked={enriched['checked']}, enriched={enriched['enriched']}, no_email={enriched['no_email']}.",
+            )
+            _job_event(job_id, "info", "clean", "Starting cleaning stage.")
             cleaned = _clean_stage_rows(conn, "enriched", limit=None)
+            _job_event(
+                job_id, "info", "clean",
+                f"Cleaning complete: checked={cleaned['checked']}, clean={cleaned['clean']}, flagged={cleaned['flagged']}, failed={cleaned['failed']}.",
+            )
             with _jobs_lock:
                 job["enriched"] = enriched
                 job["cleaned"] = cleaned
         with _jobs_lock:
             job["status"] = "completed"
+        _job_event(job_id, "info", "job", "Job completed.")
     except Exception as exc:
+        log.exception("Job %s failed", job_id)
         with _jobs_lock:
             job["status"] = "failed"
             job["error"]  = str(exc)
+        _job_event(job_id, "error", "job", f"Job failed: {exc}")
     finally:
         with _jobs_lock:
             job["completed_at"] = datetime.utcnow().isoformat()
@@ -286,7 +306,9 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
     no_email = 0
 
     def task(row):
-        return row["id"], _scrape_site_email(row["website_url"])
+        row_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
+        website_url = row["website_url"] if isinstance(row, sqlite3.Row) else row[1]
+        return row_id, _scrape_site_email(website_url)
 
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as pool:
         futures = [pool.submit(task, row) for row in rows]
@@ -353,6 +375,22 @@ def _clean_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | No
     return {"checked": len(rows), "clean": clean, "flagged": flagged, "failed": failed}
 
 
+def _job_event(job_id: str, level: str, stage: str, message: str) -> None:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        events = job.setdefault("events", [])
+        events.append({
+            "ts": datetime.utcnow().isoformat(),
+            "level": level,
+            "stage": stage,
+            "message": message,
+        })
+        if len(events) > MAX_JOB_EVENTS:
+            del events[: len(events) - MAX_JOB_EVENTS]
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -368,6 +406,23 @@ def list_jobs():
             for j in _jobs.values()
         ]
     return jsonify(sorted(jobs, key=lambda x: x["started_at"], reverse=True))
+
+
+@app.route("/api/jobs/<job_id>/events", methods=["GET"])
+def job_events(job_id: str):
+    limit = request.args.get("limit", 50, type=int)
+    if limit <= 0:
+        limit = 50
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        events = job.get("events", [])
+        return jsonify({
+            "job_id": job_id,
+            "count": len(events),
+            "events": events[-limit:],
+        })
 
 
 @app.route("/api/jobs", methods=["POST"])
@@ -413,10 +468,12 @@ def start_job():
         "run_mode":     run_mode,
         "enriched":     None,
         "cleaned":      None,
+        "events":       [],
     }
 
     with _jobs_lock:
         _jobs[job["id"]] = job
+    _job_event(job["id"], "info", "job", f"Job created ({run_mode}). Keyword='{keyword}'. Target zips={len(zips)}.")
 
     threading.Thread(target=_run_job, args=(job["id"], api_key), daemon=True).start()
     return jsonify({"id": job["id"]}), 202
