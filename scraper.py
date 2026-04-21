@@ -20,6 +20,7 @@ import requests
 from city_parse import formatted_address_from_item, resolve_city
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
 from maps_item import contact_fields_from_maps_item, iter_search_results
+from zip_geocode import us_zip_latlng
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -286,16 +287,26 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
     inserted = skipped = geo_rejected = 0
     details_cache: dict[str, dict | None] = {}
     query = _query_for_zip(keyword, zip_code)
+    coords = us_zip_latlng(zip_code)
+    if not coords:
+        log.warning(
+            "Could not geocode US zip %s — omitting lat/lng on Maps search (often empty).",
+            zip_code,
+        )
 
     for page in range(1, MAX_PAGES + 1):
-        params = {
+        params: dict[str, object] = {
             "query": query,
             "zipcode": zip_code,
             "country": "us",
             "limit": PAGE_SIZE,
             "offset": (page - 1) * PAGE_SIZE,
             "language": "en",
+            "lang": "en",
+            "zoom": 12,
         }
+        if coords:
+            params["lat"], params["lng"] = coords[0], coords[1]
         data = _get_with_backoff(f"{API_BASE}/searchmaps.php", params, api_key)
 
         if data is None:

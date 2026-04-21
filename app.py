@@ -22,6 +22,7 @@ from flask import Flask, Response, jsonify, render_template, request
 from city_parse import formatted_address_from_item, resolve_city
 from email_extract import USER_AGENT as ENRICH_USER_AGENT, scrape_email_for_website
 from maps_item import contact_fields_from_maps_item, iter_search_results
+from zip_geocode import us_zip_latlng
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
 from state_zips import STATE_NAMES, STATE_ZIPS
 
@@ -301,13 +302,37 @@ def _scrape_zip(
     inserted = skipped = geo_rejected = 0
     details_cache: dict[str, dict | None] = {}
     query = _query_for_zip(keyword, zip_code)
+    coords = us_zip_latlng(zip_code)
+    if not coords:
+        log.warning(
+            "Could not geocode US zip %s — Maps search will omit lat/lng (often returns empty).",
+            zip_code,
+        )
+        if job_id:
+            _job_event(
+                job_id,
+                "warning",
+                "scrape",
+                f"ZIP {zip_code}: geocoding failed; try again or check zip. Search may return no rows without coordinates.",
+            )
     for page in range(1, MAX_PAGES + 1):
+        params: dict[str, object] = {
+            "query": query,
+            "zipcode": zip_code,
+            "country": "us",
+            "limit": PAGE_SIZE,
+            "offset": (page - 1) * PAGE_SIZE,
+            "language": "en",
+            "lang": "en",
+            "zoom": 12,
+        }
+        if coords:
+            params["lat"], params["lng"] = coords[0], coords[1]
         data = _api_get(
             f"{API_BASE}/searchmaps.php",
-            {"query": query, "zipcode": zip_code, "country": "us",
-             "limit": PAGE_SIZE, "offset": (page - 1) * PAGE_SIZE, "language": "en"},
+            params,
             api_key,
-            log_context=f"searchmaps zip={zip_code} page={page} query={query!r}",
+            log_context=f"searchmaps zip={zip_code} page={page} query={query!r} latlng={coords!r}",
         )
         if not data:
             msg = f"searchmaps returned no JSON for zip {zip_code} page {page} (check API key and RapidAPI subscription)."

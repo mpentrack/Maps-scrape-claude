@@ -20,22 +20,33 @@ def iter_search_results(data: Any, _depth: int = 0) -> list[dict]:
     if not isinstance(data, dict):
         return []
 
+    def _dicts_from_list(v: Any) -> list[dict] | None:
+        if not isinstance(v, list) or not v:
+            return None
+        dicts = [x for x in v if isinstance(x, dict)]
+        return dicts if dicts else None
+
     priority = (
-        "data", "results", "businesses", "places", "items",
-        "records", "list", "rows", "companies",
+        "data", "results", "result", "businesses", "places", "items",
+        "records", "list", "rows", "companies", "search_results",
+        "locations", "payload",
     )
     for key in priority:
         v = data.get(key)
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            return list(v)
+        if isinstance(v, list):
+            got = _dicts_from_list(v)
+            if got:
+                return got
         if isinstance(v, dict):
             inner = iter_search_results(v, _depth + 1)
             if inner:
                 return inner
 
     for _k, v in data.items():
-        if isinstance(v, list) and v and isinstance(v[0], dict):
-            return list(v)
+        if isinstance(v, list):
+            got = _dicts_from_list(v)
+            if got:
+                return got
         if isinstance(v, dict) and _depth < 4:
             inner = iter_search_results(v, _depth + 1)
             if inner:
