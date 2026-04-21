@@ -6,14 +6,18 @@ Run: python app.py  →  http://localhost:5000
 import csv
 import io
 import os
+import re
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
+from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request
 
 from state_zips import STATE_NAMES, STATE_ZIPS
@@ -28,6 +32,13 @@ PAGE_SIZE   = 20
 MAX_PAGES   = 10
 MAX_RETRIES = 6
 JOB_WORKERS = 5   # concurrent zips per job
+ENRICH_WORKERS = 12
+EMAIL_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", re.IGNORECASE)
+PERSONAL_DOMAINS = {
+    "gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "aol.com",
+    "icloud.com", "me.com", "mac.com", "live.com", "msn.com", "protonmail.com", "proton.me",
+}
+SUBPAGES = ["/contact", "/contact-us", "/about", "/about-us"]
 
 # ── In-memory job store ───────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -56,7 +67,11 @@ def init_db() -> None:
             review_count  INTEGER,
             category      TEXT,
             zip_code      TEXT,
-            created_at    TEXT DEFAULT (datetime('now'))
+            created_at    TEXT DEFAULT (datetime('now')),
+            pipeline_stage TEXT DEFAULT 'scraped',
+            stage_reason   TEXT,
+            enriched_at    TEXT,
+            cleaned_at     TEXT
         )
     """)
     conn.execute("""
@@ -66,8 +81,16 @@ def init_db() -> None:
     """)
     # Migrate existing DBs that lack the email column
     cols = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
-    if "email" not in cols:
-        conn.execute("ALTER TABLE businesses ADD COLUMN email TEXT")
+    for col, ddl in {
+        "email": "ALTER TABLE businesses ADD COLUMN email TEXT",
+        "pipeline_stage": "ALTER TABLE businesses ADD COLUMN pipeline_stage TEXT DEFAULT 'scraped'",
+        "stage_reason": "ALTER TABLE businesses ADD COLUMN stage_reason TEXT",
+        "enriched_at": "ALTER TABLE businesses ADD COLUMN enriched_at TEXT",
+        "cleaned_at": "ALTER TABLE businesses ADD COLUMN cleaned_at TEXT",
+    }.items():
+        if col not in cols:
+            conn.execute(ddl)
+    conn.execute("UPDATE businesses SET pipeline_stage='scraped' WHERE pipeline_stage IS NULL OR pipeline_stage=''")
     conn.commit()
     conn.close()
 
@@ -117,10 +140,10 @@ def _insert(conn: sqlite3.Connection, lock: threading.Lock, row: dict) -> bool:
         try:
             conn.execute(
                 "INSERT INTO businesses "
-                "(business_name, address, phone, website_url, rating, review_count, category, zip_code) "
-                "VALUES (?,?,?,?,?,?,?,?)",
+                "(business_name, address, phone, website_url, rating, review_count, category, zip_code, pipeline_stage) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (row["business_name"], row["address"], phone, url,
-                 row["rating"], row["review_count"], row["category"], row["zip_code"]),
+                 row["rating"], row["review_count"], row["category"], row["zip_code"], "scraped"),
             )
             conn.commit()
             return True
@@ -174,6 +197,12 @@ def _run_job(job_id: str, api_key: str) -> None:
                     job["inserted"]   += ins
                     job["duplicates"] += skp
                     job["processed"]  += 1
+        if job.get("run_mode") == "full_pipeline":
+            enriched = _enrich_stage_rows(conn, "scraped", limit=None)
+            cleaned = _clean_stage_rows(conn, "enriched", limit=None)
+            with _jobs_lock:
+                job["enriched"] = enriched
+                job["cleaned"] = cleaned
         with _jobs_lock:
             job["status"] = "completed"
     except Exception as exc:
@@ -184,6 +213,144 @@ def _run_job(job_id: str, api_key: str) -> None:
         with _jobs_lock:
             job["completed_at"] = datetime.utcnow().isoformat()
         conn.close()
+
+
+def _normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+    return url.rstrip("/")
+
+
+def _extract_email_candidates(html: str) -> list[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    found = []
+    for tag in soup.find_all("a", href=True):
+        href = tag["href"]
+        if href.lower().startswith("mailto:"):
+            addr = href[7:].split("?")[0].strip().lower()
+            if EMAIL_RE.fullmatch(addr):
+                found.append(addr)
+    for m in EMAIL_RE.finditer(soup.get_text(" ")):
+        found.append(m.group(0).lower())
+    dedup = []
+    seen = set()
+    for email in found:
+        if email not in seen:
+            seen.add(email)
+            dedup.append(email)
+    return dedup
+
+
+def _pick_best_email(emails: list[str]) -> str | None:
+    if not emails:
+        return None
+    non_generic = [e for e in emails if e.split("@")[0] not in {"info", "hello", "contact", "support", "sales"}]
+    return non_generic[0] if non_generic else emails[0]
+
+
+def _scrape_site_email(website_url: str) -> str | None:
+    base = _normalize_url(website_url)
+    if not base:
+        return None
+    urls = [base] + [urljoin(base + "/", p.lstrip("/")) for p in SUBPAGES]
+    all_emails = []
+    for url in urls:
+        try:
+            resp = requests.get(url, timeout=6, allow_redirects=True, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code >= 400:
+                continue
+            all_emails.extend(_extract_email_candidates(resp.text))
+            best = _pick_best_email(all_emails)
+            if best and best.split("@")[0] not in {"info", "hello", "contact", "support", "sales"}:
+                return best
+        except requests.RequestException:
+            continue
+    return _pick_best_email(all_emails)
+
+
+def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | None) -> dict:
+    where = "WHERE pipeline_stage = ? AND website_url IS NOT NULL AND (email IS NULL OR email = '')"
+    params = [from_stage]
+    query = "SELECT id, website_url FROM businesses " + where + " ORDER BY id ASC"
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    if not rows:
+        return {"checked": 0, "enriched": 0, "no_email": 0}
+
+    result_lock = threading.Lock()
+    enriched = 0
+    no_email = 0
+
+    def task(row):
+        return row["id"], _scrape_site_email(row["website_url"])
+
+    with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as pool:
+        futures = [pool.submit(task, row) for row in rows]
+        for fut in as_completed(futures):
+            row_id, email = fut.result()
+            now = datetime.utcnow().isoformat()
+            if email:
+                conn.execute(
+                    "UPDATE businesses SET email=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=? WHERE id=?",
+                    (email, now, row_id),
+                )
+                with result_lock:
+                    enriched += 1
+            else:
+                conn.execute(
+                    "UPDATE businesses SET pipeline_stage='enrich_failed', stage_reason='no_email_found', enriched_at=? WHERE id=?",
+                    (now, row_id),
+                )
+                with result_lock:
+                    no_email += 1
+            conn.commit()
+    return {"checked": len(rows), "enriched": enriched, "no_email": no_email}
+
+
+def _classify_clean_stage(row: sqlite3.Row) -> tuple[str, str | None]:
+    email = (row["email"] or "").strip().lower()
+    name = (row["business_name"] or "").lower()
+    review_count = row["review_count"]
+    if not email:
+        return "clean_failed", "missing_email"
+    if email.split("@")[-1] in PERSONAL_DOMAINS:
+        return "flagged", "personal_email_domain"
+    if "permanently closed" in name:
+        return "flagged", "permanently_closed"
+    if review_count is None or review_count < 5:
+        return "flagged", "low_review_count"
+    return "clean", None
+
+
+def _clean_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | None) -> dict:
+    query = "SELECT * FROM businesses WHERE pipeline_stage = ? ORDER BY id ASC"
+    params = [from_stage]
+    if limit:
+        query += " LIMIT ?"
+        params.append(limit)
+    rows = conn.execute(query, params).fetchall()
+    clean = 0
+    flagged = 0
+    failed = 0
+    now = datetime.utcnow().isoformat()
+    for row in rows:
+        stage, reason = _classify_clean_stage(row)
+        conn.execute(
+            "UPDATE businesses SET pipeline_stage=?, stage_reason=?, cleaned_at=? WHERE id=?",
+            (stage, reason, now, row["id"]),
+        )
+        if stage == "clean":
+            clean += 1
+        elif stage == "flagged":
+            flagged += 1
+        else:
+            failed += 1
+    conn.commit()
+    return {"checked": len(rows), "clean": clean, "flagged": flagged, "failed": failed}
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -210,6 +377,7 @@ def start_job():
     api_key     = (data.get("api_key")     or "").strip()
     state       = (data.get("state")       or "").strip().upper()
     custom_zips = (data.get("custom_zips") or "").strip()
+    run_mode    = (data.get("run_mode") or "scrape_only").strip()
 
     if not keyword:
         return jsonify({"error": "Keyword is required"}), 400
@@ -227,6 +395,8 @@ def start_job():
         return jsonify({"error": "No zip codes found"}), 400
 
     zips = list(dict.fromkeys(zips))  # deduplicate
+    if run_mode not in {"scrape_only", "full_pipeline"}:
+        return jsonify({"error": "Invalid run mode"}), 400
     job = {
         "id":           str(uuid.uuid4())[:8],
         "keyword":      keyword,
@@ -240,6 +410,9 @@ def start_job():
         "started_at":   datetime.utcnow().isoformat(),
         "completed_at": None,
         "error":        None,
+        "run_mode":     run_mode,
+        "enriched":     None,
+        "cleaned":      None,
     }
 
     with _jobs_lock:
@@ -261,14 +434,18 @@ def stats():
             "SELECT category, COUNT(*) cnt FROM businesses "
             "WHERE category IS NOT NULL GROUP BY category ORDER BY cnt DESC LIMIT 12"
         ).fetchall()
+        stage_counts = conn.execute(
+            "SELECT pipeline_stage, COUNT(*) cnt FROM businesses GROUP BY pipeline_stage ORDER BY cnt DESC"
+        ).fetchall()
         conn.close()
         return jsonify({
             "total":      total,
             "with_email": with_email,
             "categories": [{"name": r["category"], "count": r["cnt"]} for r in categories],
+            "stages":     [{"name": r["pipeline_stage"] or "unknown", "count": r["cnt"]} for r in stage_counts],
         })
     except Exception:
-        return jsonify({"total": 0, "with_email": 0, "categories": []})
+        return jsonify({"total": 0, "with_email": 0, "categories": [], "stages": []})
 
 
 @app.route("/api/categories")
@@ -292,8 +469,9 @@ def leads():
     min_reviews = request.args.get("min_reviews", 0,     type=int)
     has_email   = request.args.get("has_email",   "false").lower() == "true"
     category    = request.args.get("category",    "")
+    stage       = request.args.get("stage",       "")
 
-    where, params = _build_where(min_rating, min_reviews, has_email, category)
+    where, params = _build_where(min_rating, min_reviews, has_email, category, stage)
     offset = (page - 1) * per_page
 
     try:
@@ -321,13 +499,14 @@ def export():
     min_reviews = request.args.get("min_reviews", 0,     type=int)
     has_email   = request.args.get("has_email",   "false").lower() == "true"
     category    = request.args.get("category",    "")
+    stage       = request.args.get("stage",       "")
 
-    where, params = _build_where(min_rating, min_reviews, has_email, category)
+    where, params = _build_where(min_rating, min_reviews, has_email, category, stage)
 
     conn = get_conn()
     rows = conn.execute(
         f"SELECT business_name, address, phone, website_url, email, "
-        f"rating, review_count, category, zip_code FROM businesses {where} ORDER BY id DESC",
+        f"rating, review_count, category, zip_code, pipeline_stage, stage_reason FROM businesses {where} ORDER BY id DESC",
         params,
     ).fetchall()
     conn.close()
@@ -336,7 +515,7 @@ def export():
         buf = io.StringIO()
         w   = csv.writer(buf)
         w.writerow(["business_name","address","phone","website_url","email",
-                    "rating","review_count","category","zip_code"])
+                    "rating","review_count","category","zip_code","pipeline_stage","stage_reason"])
         for row in rows:
             w.writerow(list(row))
         yield buf.getvalue()
@@ -349,7 +528,7 @@ def export():
     )
 
 
-def _build_where(min_rating: float, min_reviews: int, has_email: bool, category: str):
+def _build_where(min_rating: float, min_reviews: int, has_email: bool, category: str, stage: str):
     clauses, params = [], []
     if min_rating > 0:
         clauses.append("rating >= ?");     params.append(min_rating)
@@ -359,8 +538,46 @@ def _build_where(min_rating: float, min_reviews: int, has_email: bool, category:
         clauses.append("email IS NOT NULL AND email != ''")
     if category:
         clauses.append("category = ?");    params.append(category)
+    if stage:
+        clauses.append("pipeline_stage = ?"); params.append(stage)
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     return where, params
+
+
+@app.route("/api/pipeline/advance", methods=["POST"])
+def advance_pipeline():
+    data = request.get_json(force=True)
+    from_stage = (data.get("from_stage") or "").strip()
+    action = (data.get("action") or "").strip()  # enrich or clean
+    limit = data.get("limit")
+    if action not in {"enrich", "clean"}:
+        return jsonify({"error": "Action must be 'enrich' or 'clean'"}), 400
+    if not from_stage:
+        return jsonify({"error": "from_stage is required"}), 400
+    try:
+        if limit is not None:
+            limit = int(limit)
+            if limit <= 0:
+                limit = None
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be a number"}), 400
+
+    conn = get_conn()
+    try:
+        if action == "enrich":
+            result = _enrich_stage_rows(conn, from_stage, limit)
+        else:
+            result = _clean_stage_rows(conn, from_stage, limit)
+        return jsonify({"ok": True, "action": action, "from_stage": from_stage, "result": result})
+    finally:
+        conn.close()
+
+
+@app.route("/api/stages")
+def stages():
+    return jsonify([
+        "scraped", "enriched", "enrich_failed", "clean", "flagged", "clean_failed",
+    ])
 
 
 @app.route("/api/download/<path:filename>")

@@ -266,6 +266,17 @@
     .form-check-input:checked { background-color: var(--accent); border-color: var(--accent); }
 
     .empty-msg { color: var(--muted); font-size: 0.82rem; text-align: center; padding: 2rem 0; }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 12px;
+      font-size: 0.78rem;
+    }
+    .legend-item { color: var(--muted); }
+    .legend-item b { color: var(--text); font-weight: 600; }
+    @media (max-width: 1100px) {
+      .legend-grid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -326,6 +337,14 @@
               placeholder="Paste your key here">
           </div>
 
+          <div class="mb-3">
+            <label class="lbl">Run Mode</label>
+            <select class="form-select" id="inp-run-mode">
+              <option value="scrape_only">Scrape only</option>
+              <option value="full_pipeline">Full pipeline (scrape → enrich → clean)</option>
+            </select>
+          </div>
+
           <button class="btn-accent w-100" id="btn-start" onclick="startJob()">
             <i class="bi bi-play-fill"></i>&nbsp; Start Scrape
           </button>
@@ -341,6 +360,29 @@
         </div>
         <div class="card-body" id="jobs-list" style="padding:0.75rem">
           <div class="empty-msg">No jobs yet. Start a scrape above.</div>
+        </div>
+      </div>
+
+      <div class="card mt-3">
+        <div class="card-hd"><span>Bulk Stage Actions</span></div>
+        <div class="card-body">
+          <div class="mb-2">
+            <label class="lbl">Source Stage</label>
+            <select class="form-select" id="bulk-stage">
+              <option value="scraped">scraped</option>
+              <option value="enrich_failed">enrich_failed</option>
+              <option value="enriched">enriched</option>
+            </select>
+          </div>
+          <div class="mb-2">
+            <label class="lbl">Limit (optional)</label>
+            <input type="number" class="form-control" id="bulk-limit" min="1" placeholder="e.g. 500">
+          </div>
+          <div class="d-grid gap-2">
+            <button class="btn-ghost" onclick="advanceStage('enrich')">Run Enrichment on Stage</button>
+            <button class="btn-ghost" onclick="advanceStage('clean')">Run Cleaning on Stage</button>
+          </div>
+          <div id="bulk-msg" class="mt-2" style="font-size:0.78rem;color:var(--muted)"></div>
         </div>
       </div>
     </div>
@@ -378,6 +420,20 @@
         </div>
       </div>
 
+      <div class="card mb-3">
+        <div class="card-hd"><span>Pipeline Legend</span></div>
+        <div class="card-body">
+          <div class="legend-grid">
+            <div class="legend-item"><span class="chip">scraped</span> <b>Step 1 complete:</b> lead captured from Maps API.</div>
+            <div class="legend-item"><span class="chip">enriched</span> <b>Step 2 complete:</b> email found from website scrape.</div>
+            <div class="legend-item"><span class="chip">enrich_failed</span> <b>Step 2 failed:</b> no email found or site inaccessible.</div>
+            <div class="legend-item"><span class="chip">clean</span> <b>Step 3 complete:</b> passed quality checks.</div>
+            <div class="legend-item"><span class="chip">flagged</span> <b>Step 3 review:</b> low trust or excluded criteria.</div>
+            <div class="legend-item"><span class="chip">clean_failed</span> <b>Step 3 failed:</b> missing required data.</div>
+          </div>
+        </div>
+      </div>
+
       <!-- Leads table + filters + export -->
       <div class="card">
         <div class="card-hd">
@@ -411,6 +467,13 @@
             </select>
           </div>
 
+          <div class="filter-group">
+            <label class="lbl">Pipeline Stage</label>
+            <select class="form-select" id="f-stage" onchange="loadLeads(1)" style="min-width:150px">
+              <option value="">All stages</option>
+            </select>
+          </div>
+
           <div class="filter-group" style="justify-content:flex-end;padding-bottom:2px">
             <label class="lbl">Has Email</label>
             <div class="form-check form-switch mb-0" style="padding-left:2.5rem">
@@ -435,10 +498,11 @@
                 <th>Reviews</th>
                 <th>Category</th>
                 <th>Zip</th>
+                <th>Stage</th>
               </tr>
             </thead>
             <tbody id="leads-tbody">
-              <tr><td colspan="7"><div class="empty-msg">No leads yet.</div></td></tr>
+              <tr><td colspan="8"><div class="empty-msg">No leads yet.</div></td></tr>
             </tbody>
           </table>
         </div>
@@ -478,6 +542,7 @@ async function startJob() {
   const apiKey     = document.getElementById('inp-apikey').value.trim();
   const state      = document.getElementById('inp-state').value;
   const customZips = document.getElementById('inp-zips').value;
+  const runMode    = document.getElementById('inp-run-mode').value;
   const errEl      = document.getElementById('job-error');
   errEl.style.display = 'none';
 
@@ -489,7 +554,7 @@ async function startJob() {
     const res = await fetch('/api/jobs', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({keyword, api_key: apiKey, state, custom_zips: customZips}),
+      body: JSON.stringify({keyword, api_key: apiKey, state, custom_zips: customZips, run_mode: runMode}),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -538,6 +603,7 @@ async function refreshJobs() {
           <div>
             <span style="font-weight:600;font-size:0.85rem">${esc(j.keyword)}</span>
             ${j.state ? `<span class="chip ms-1">${esc(j.state)}</span>` : ''}
+            ${j.run_mode ? `<span class="chip ms-1">${esc(j.run_mode)}</span>` : ''}
           </div>
           <span class="status-badge badge-${j.status}">${j.status}</span>
         </div>
@@ -548,6 +614,8 @@ async function refreshJobs() {
           <span>${j.processed}/${j.total} zips</span>
           <span style="color:var(--green)">+${j.inserted.toLocaleString()} new</span>
           <span>${j.duplicates.toLocaleString()} dup</span>
+          ${j.enriched ? `<span>enriched ${j.enriched.enriched || 0}/${j.enriched.checked || 0}</span>` : ''}
+          ${j.cleaned ? `<span>clean ${j.cleaned.clean || 0}/${j.cleaned.checked || 0}</span>` : ''}
           <span style="margin-left:auto">${pct}%</span>
         </div>
         ${j.error ? `<div style="color:var(--red);font-size:0.72rem;margin-top:4px">${esc(j.error)}</div>` : ''}
@@ -598,6 +666,11 @@ async function refreshStats() {
   const cur = sel.value;
   sel.innerHTML = '<option value="">All categories</option>' +
     d.categories.map(c => `<option value="${esc(c.name)}"${c.name===cur?' selected':''}>${esc(c.name)}</option>`).join('');
+
+  const stageSel = document.getElementById('f-stage');
+  const curStage = stageSel.value;
+  stageSel.innerHTML = '<option value="">All stages</option>' +
+    (d.stages || []).map(s => `<option value="${esc(s.name)}"${s.name===curStage?' selected':''}>${esc(s.name)} (${s.count})</option>`).join('');
 }
 
 // ── Leads table ────────────────────────────────────────────────────────────
@@ -614,6 +687,7 @@ async function loadLeads(page) {
     min_reviews: document.getElementById('f-reviews').value,
     has_email:   document.getElementById('f-email').checked,
     category:    document.getElementById('f-category').value,
+    stage:       document.getElementById('f-stage').value,
   });
 
   const res = await fetch('/api/leads?' + params);
@@ -628,7 +702,7 @@ async function loadLeads(page) {
 
   const tbody = document.getElementById('leads-tbody');
   if (!d.leads || !d.leads.length) {
-    tbody.innerHTML = '<tr><td colspan="7"><div class="empty-msg">No leads match your filters.</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="8"><div class="empty-msg">No leads match your filters.</div></td></tr>';
     return;
   }
 
@@ -644,6 +718,7 @@ async function loadLeads(page) {
       <td>${r.review_count != null ? r.review_count.toLocaleString() : '—'}</td>
       <td><span class="chip">${esc(r.category||'—')}</span></td>
       <td style="color:var(--muted)">${esc(r.zip_code||'—')}</td>
+      <td><span class="chip">${esc(r.pipeline_stage||'—')}</span></td>
     </tr>`).join('');
 }
 
@@ -659,8 +734,34 @@ function exportCSV() {
     min_reviews: document.getElementById('f-reviews').value,
     has_email:   document.getElementById('f-email').checked,
     category:    document.getElementById('f-category').value,
+    stage:       document.getElementById('f-stage').value,
   });
   window.location = '/api/export?' + params;
+}
+
+async function advanceStage(action) {
+  const fromStage = document.getElementById('bulk-stage').value;
+  const limitRaw = document.getElementById('bulk-limit').value.trim();
+  const msg = document.getElementById('bulk-msg');
+  msg.textContent = 'Running...';
+  const payload = {action, from_stage: fromStage};
+  if (limitRaw) payload.limit = Number(limitRaw);
+
+  const res = await fetch('/api/pipeline/advance', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload),
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = data.error || 'Bulk action failed';
+    return;
+  }
+  msg.style.color = 'var(--green)';
+  msg.textContent = `${action} finished: ${JSON.stringify(data.result)}`;
+  await refreshStats();
+  await loadLeads(currentPage);
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
