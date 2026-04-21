@@ -24,6 +24,90 @@ _CITY_BEFORE_STATE_ZIP = re.compile(
 )
 
 
+def _str_val(v: Any) -> str | None:
+    if v is None or isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        if isinstance(v, float) and not v.is_integer():
+            return str(v)
+        return str(int(v))
+    if isinstance(v, str):
+        s = v.strip()
+        return s or None
+    return None
+
+
+def formatted_address_from_item(item: dict[str, Any] | None) -> str | None:
+    """
+    Single-line address for DB/CSV from typical Maps / Places JSON shapes.
+    Covers camelCase keys and nested address dicts when full_address is absent.
+    """
+    if not item or not isinstance(item, dict):
+        return None
+
+    for key in (
+        "full_address", "formatted_address", "formattedAddress", "fullAddress",
+        "address_string", "location_address", "locationAddress",
+    ):
+        s = _str_val(item.get(key))
+        if s:
+            return s
+
+    raw = item.get("address")
+    if isinstance(raw, str):
+        s = _str_val(raw)
+        if s:
+            return s
+
+    if isinstance(raw, dict):
+        for key in ("formatted_address", "formatted", "formattedAddress"):
+            s = _str_val(raw.get(key))
+            if s:
+                return s
+
+        sa = _str_val(raw.get("street_address"))
+        sn = _str_val(raw.get("street_number"))
+        rt = _str_val(raw.get("route") or raw.get("street"))
+        if sa:
+            street_line = sa
+        else:
+            parts = [p for p in (sn, rt) if p]
+            street_line = " ".join(parts) if parts else None
+
+        city = _str_val(raw.get("city") or raw.get("locality") or raw.get("town"))
+        st_raw = raw.get("state") or raw.get("administrative_area_level_1") or raw.get("administrative_area")
+        if isinstance(st_raw, dict):
+            st = _str_val(st_raw.get("short_name") or st_raw.get("long_name"))
+        else:
+            st = _str_val(st_raw)
+        postal = _str_val(
+            raw.get("postal_code") or raw.get("zip_code") or raw.get("zip") or raw.get("postcode")
+        )
+
+        locality_bits: list[str] = []
+        if city:
+            locality_bits.append(city)
+        if st and postal:
+            locality_bits.append(f"{st} {postal}")
+        elif st:
+            locality_bits.append(st)
+        elif postal:
+            locality_bits.append(postal)
+
+        if street_line and locality_bits:
+            return f"{street_line}, {', '.join(locality_bits)}"
+        if locality_bits:
+            return ", ".join(locality_bits)
+        if street_line:
+            return street_line
+
+    s = _str_val(item.get("vicinity"))
+    if s:
+        return s
+
+    return None
+
+
 def _clean_city(value: str | None) -> str | None:
     if not value or not isinstance(value, str):
         return None

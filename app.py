@@ -21,7 +21,7 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request
 
-from city_parse import resolve_city
+from city_parse import formatted_address_from_item, resolve_city
 from geo_zip import listing_matches_search_zip
 from state_zips import STATE_NAMES, STATE_ZIPS
 
@@ -135,11 +135,13 @@ def _api_get(url: str, params: dict, api_key: str):
 def _parse(item: dict, zip_code: str) -> dict:
     types = item.get("types")
     category = types[0] if isinstance(types, list) and types else item.get("type") or item.get("category")
-    raw_addr = item.get("full_address") or item.get("address")
-    if isinstance(raw_addr, dict):
-        address = raw_addr.get("formatted_address") or raw_addr.get("formatted")
-    else:
-        address = raw_addr if isinstance(raw_addr, str) else None
+    address = formatted_address_from_item(item)
+    if not address:
+        raw_addr = item.get("full_address") or item.get("address")
+        if isinstance(raw_addr, dict):
+            address = raw_addr.get("formatted_address") or raw_addr.get("formatted")
+        else:
+            address = raw_addr if isinstance(raw_addr, str) else None
     city = resolve_city(item, address, zip_code)
     return {
         "business_name": item.get("name") or item.get("title"),

@@ -16,7 +16,7 @@ from threading import Lock
 
 import requests
 
-from city_parse import resolve_city
+from city_parse import formatted_address_from_item, resolve_city
 from geo_zip import listing_matches_search_zip
 
 # ---------------------------------------------------------------------------
@@ -169,11 +169,13 @@ def _get_with_backoff(url: str, params: dict, api_key: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def _parse_result(item: dict, zip_code: str) -> dict:
-    raw_addr = item.get("full_address") or item.get("address")
-    if isinstance(raw_addr, dict):
-        address = raw_addr.get("formatted_address") or raw_addr.get("formatted")
-    else:
-        address = raw_addr if isinstance(raw_addr, str) else None
+    address = formatted_address_from_item(item)
+    if not address:
+        raw_addr = item.get("full_address") or item.get("address")
+        if isinstance(raw_addr, dict):
+            address = raw_addr.get("formatted_address") or raw_addr.get("formatted")
+        else:
+            address = raw_addr if isinstance(raw_addr, str) else None
     city = resolve_city(item, address, zip_code)
     return {
         "business_name": item.get("name") or item.get("title"),
