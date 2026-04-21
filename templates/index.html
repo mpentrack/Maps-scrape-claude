@@ -519,12 +519,13 @@
                 <th>Rating</th>
                 <th>Reviews</th>
                 <th>Category</th>
+                <th>City</th>
                 <th>Zip</th>
                 <th>Stage</th>
               </tr>
             </thead>
             <tbody id="leads-tbody">
-              <tr><td colspan="8"><div class="empty-msg">No leads yet.</div></td></tr>
+              <tr><td colspan="9"><div class="empty-msg">No leads yet.</div></td></tr>
             </tbody>
           </table>
         </div>
@@ -748,7 +749,7 @@ async function loadLeads(page) {
 
   const tbody = document.getElementById('leads-tbody');
   if (!d.leads || !d.leads.length) {
-    tbody.innerHTML = '<tr><td colspan="8"><div class="empty-msg">No leads match your filters.</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="9"><div class="empty-msg">No leads match your filters.</div></td></tr>';
     return;
   }
 
@@ -763,6 +764,7 @@ async function loadLeads(page) {
       <td style="white-space:nowrap">${r.rating ? '&#9733; ' + r.rating : '—'}</td>
       <td>${r.review_count != null ? r.review_count.toLocaleString() : '—'}</td>
       <td><span class="chip">${esc(r.category||'—')}</span></td>
+      <td style="color:var(--muted)">${esc(r.city||'—')}</td>
       <td style="color:var(--muted)">${esc(r.zip_code||'—')}</td>
       <td><span class="chip">${esc(r.pipeline_stage||'—')}</span></td>
     </tr>`).join('');

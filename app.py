@@ -21,6 +21,7 @@ import requests
 from bs4 import BeautifulSoup
 from flask import Flask, Response, jsonify, render_template, request
 
+from city_parse import resolve_city
 from state_zips import STATE_NAMES, STATE_ZIPS
 
 app = Flask(__name__)
@@ -71,6 +72,7 @@ def init_db() -> None:
             review_count  INTEGER,
             category      TEXT,
             zip_code      TEXT,
+            city          TEXT,
             created_at    TEXT DEFAULT (datetime('now')),
             pipeline_stage TEXT DEFAULT 'scraped',
             stage_reason   TEXT,
@@ -85,8 +87,10 @@ def init_db() -> None:
     """)
     # Migrate existing DBs that lack the email column
     cols = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
+    city_was_new = "city" not in cols
     for col, ddl in {
         "email": "ALTER TABLE businesses ADD COLUMN email TEXT",
+        "city": "ALTER TABLE businesses ADD COLUMN city TEXT",
         "pipeline_stage": "ALTER TABLE businesses ADD COLUMN pipeline_stage TEXT DEFAULT 'scraped'",
         "stage_reason": "ALTER TABLE businesses ADD COLUMN stage_reason TEXT",
         "enriched_at": "ALTER TABLE businesses ADD COLUMN enriched_at TEXT",
@@ -95,6 +99,13 @@ def init_db() -> None:
         if col not in cols:
             conn.execute(ddl)
     conn.execute("UPDATE businesses SET pipeline_stage='scraped' WHERE pipeline_stage IS NULL OR pipeline_stage=''")
+    if city_was_new:
+        for row in conn.execute(
+            "SELECT id, address FROM businesses WHERE address IS NOT NULL AND TRIM(address) != ''"
+        ):
+            cy = resolve_city(None, row["address"], None)
+            if cy:
+                conn.execute("UPDATE businesses SET city = ? WHERE id = ?", (cy, row["id"]))
     conn.commit()
     conn.close()
 
@@ -123,9 +134,16 @@ def _api_get(url: str, params: dict, api_key: str):
 def _parse(item: dict, zip_code: str) -> dict:
     types = item.get("types")
     category = types[0] if isinstance(types, list) and types else item.get("type") or item.get("category")
+    raw_addr = item.get("full_address") or item.get("address")
+    if isinstance(raw_addr, dict):
+        address = raw_addr.get("formatted_address") or raw_addr.get("formatted")
+    else:
+        address = raw_addr if isinstance(raw_addr, str) else None
+    city = resolve_city(item, address, zip_code)
     return {
         "business_name": item.get("name") or item.get("title"),
-        "address":       item.get("full_address") or item.get("address"),
+        "address":       address,
+        "city":          city,
         "phone":         item.get("phone_number") or item.get("phone"),
         "website_url":   item.get("website"),
         "rating":        item.get("rating"),
@@ -144,9 +162,9 @@ def _insert(conn: sqlite3.Connection, lock: threading.Lock, row: dict) -> bool:
         try:
             conn.execute(
                 "INSERT INTO businesses "
-                "(business_name, address, phone, website_url, rating, review_count, category, zip_code, pipeline_stage) "
-                "VALUES (?,?,?,?,?,?,?,?,?)",
-                (row["business_name"], row["address"], phone, url,
+                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, pipeline_stage) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (row["business_name"], row["address"], row.get("city"), phone, url,
                  row["rating"], row["review_count"], row["category"], row["zip_code"], "scraped"),
             )
             conn.commit()
@@ -562,7 +580,7 @@ def export():
 
     conn = get_conn()
     rows = conn.execute(
-        f"SELECT business_name, address, phone, website_url, email, "
+        f"SELECT business_name, address, city, phone, website_url, email, "
         f"rating, review_count, category, zip_code, pipeline_stage, stage_reason FROM businesses {where} ORDER BY id DESC",
         params,
     ).fetchall()
@@ -571,7 +589,7 @@ def export():
     def generate():
         buf = io.StringIO()
         w   = csv.writer(buf)
-        w.writerow(["business_name","address","phone","website_url","email",
+        w.writerow(["business_name","address","city","phone","website_url","email",
                     "rating","review_count","category","zip_code","pipeline_stage","stage_reason"])
         for row in rows:
             w.writerow(list(row))

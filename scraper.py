@@ -16,6 +16,8 @@ from threading import Lock
 
 import requests
 
+from city_parse import resolve_city
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -47,6 +49,7 @@ def init_db(path: str) -> sqlite3.Connection:
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             business_name TEXT,
             address      TEXT,
+            city         TEXT,
             phone        TEXT,
             website_url  TEXT,
             rating       REAL,
@@ -56,6 +59,9 @@ def init_db(path: str) -> sqlite3.Connection:
             created_at   TEXT DEFAULT (datetime('now'))
         )
     """)
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
+    if "city" not in cols:
+        conn.execute("ALTER TABLE businesses ADD COLUMN city TEXT")
     # Composite unique index for dedup logic
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_phone_url
@@ -83,13 +89,14 @@ def insert_business(conn: sqlite3.Connection, row: dict) -> bool:
             conn.execute(
                 """
                 INSERT INTO businesses
-                    (business_name, address, phone, website_url,
+                    (business_name, address, city, phone, website_url,
                      rating, review_count, category, zip_code)
-                VALUES (?,?,?,?,?,?,?,?)
+                VALUES (?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     row.get("business_name"),
                     row.get("address"),
+                    row.get("city"),
                     phone,
                     url,
                     row.get("rating"),
@@ -147,9 +154,16 @@ def _get_with_backoff(url: str, params: dict, api_key: str) -> dict | None:
 # ---------------------------------------------------------------------------
 
 def _parse_result(item: dict, zip_code: str) -> dict:
+    raw_addr = item.get("full_address") or item.get("address")
+    if isinstance(raw_addr, dict):
+        address = raw_addr.get("formatted_address") or raw_addr.get("formatted")
+    else:
+        address = raw_addr if isinstance(raw_addr, str) else None
+    city = resolve_city(item, address, zip_code)
     return {
         "business_name": item.get("name") or item.get("title"),
-        "address":       item.get("full_address") or item.get("address"),
+        "address":       address,
+        "city":          city,
         "phone":         item.get("phone_number") or item.get("phone"),
         "website_url":   item.get("website"),
         "rating":        item.get("rating"),

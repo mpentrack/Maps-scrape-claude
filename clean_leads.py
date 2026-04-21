@@ -53,7 +53,7 @@ CLOSED_PATTERN = re.compile(r"permanently\s+closed", re.IGNORECASE)
 LOW_REVIEW_THRESHOLD = 5
 
 OUTPUT_COLS = [
-    "id", "business_name", "address", "phone", "website_url",
+    "id", "business_name", "address", "city", "phone", "website_url",
     "email", "rating", "review_count", "category", "zip_code",
 ]
 
@@ -76,8 +76,12 @@ log = logging.getLogger(__name__)
 def load_records(db_path: str) -> list[dict]:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
+    if "city" not in cols:
+        conn.execute("ALTER TABLE businesses ADD COLUMN city TEXT")
+        conn.commit()
     rows = conn.execute(
-        "SELECT id, business_name, address, phone, website_url, email, "
+        "SELECT id, business_name, address, city, phone, website_url, email, "
         "rating, review_count, category, zip_code "
         "FROM businesses "
         "WHERE email IS NOT NULL AND email != '' "
