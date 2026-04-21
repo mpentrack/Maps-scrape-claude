@@ -48,6 +48,7 @@ def formatted_address_from_item(item: dict[str, Any] | None) -> str | None:
     for key in (
         "full_address", "formatted_address", "formattedAddress", "fullAddress",
         "address_string", "location_address", "locationAddress",
+        "address1", "address_1", "street_address", "streetAddress",
     ):
         s = _str_val(item.get(key))
         if s:
@@ -74,7 +75,7 @@ def formatted_address_from_item(item: dict[str, Any] | None) -> str | None:
             parts = [p for p in (sn, rt) if p]
             street_line = " ".join(parts) if parts else None
 
-        city = _str_val(raw.get("city") or raw.get("locality") or raw.get("town"))
+        city = _str_val(raw.get("city") or raw.get("locality") or raw.get("town") or raw.get("postal_town"))
         st_raw = raw.get("state") or raw.get("administrative_area_level_1") or raw.get("administrative_area")
         if isinstance(st_raw, dict):
             st = _str_val(st_raw.get("short_name") or st_raw.get("long_name"))
@@ -120,7 +121,7 @@ def city_from_maps_item(item: dict[str, Any] | None) -> str | None:
     if not item or not isinstance(item, dict):
         return None
 
-    for key in ("city", "locality", "city_name", "town"):
+    for key in ("city", "locality", "city_name", "town", "postal_town", "cityName"):
         v = item.get(key)
         if isinstance(v, str):
             c = _clean_city(v)

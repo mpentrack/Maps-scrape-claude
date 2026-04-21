@@ -31,6 +31,12 @@ PAGE_SIZE = 20          # results per page (API default)
 MAX_PAGES = 10          # safety cap per zip
 BACKOFF_BASE = 1.0      # seconds; doubles each retry
 MAX_RETRIES = 6
+DETAIL_ENDPOINTS = (
+    "/place.php",
+    "/place-details.php",
+    "/placedetails.php",
+    "/place_details.php",
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -190,6 +196,64 @@ def _parse_result(item: dict, zip_code: str) -> dict:
     }
 
 
+def _extract_place_token(item: dict) -> str | None:
+    for k in ("place_id", "google_id", "placeId", "googleId", "cid", "data_id", "business_id"):
+        v = item.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def _first_dict_payload(data: dict | None) -> dict | None:
+    if not isinstance(data, dict):
+        return None
+    if isinstance(data.get("data"), dict):
+        return data["data"]
+    if isinstance(data.get("result"), dict):
+        return data["result"]
+    if isinstance(data.get("place"), dict):
+        return data["place"]
+    if isinstance(data.get("data"), list) and data["data"] and isinstance(data["data"][0], dict):
+        return data["data"][0]
+    if isinstance(data.get("results"), list) and data["results"] and isinstance(data["results"][0], dict):
+        return data["results"][0]
+    return data
+
+
+def _fetch_place_details(place_token: str, api_key: str, cache: dict[str, dict | None]) -> dict | None:
+    if place_token in cache:
+        return cache[place_token]
+    for ep in DETAIL_ENDPOINTS:
+        for params in (
+            {"place_id": place_token, "language": "en"},
+            {"google_id": place_token, "language": "en"},
+            {"cid": place_token, "language": "en"},
+        ):
+            data = _get_with_backoff(f"{API_BASE}{ep}", params, api_key)
+            payload = _first_dict_payload(data)
+            if isinstance(payload, dict) and payload:
+                cache[place_token] = payload
+                return payload
+    cache[place_token] = None
+    return None
+
+
+def _hydrate_row_location(row: dict, item: dict, zip_code: str, api_key: str, cache: dict[str, dict | None]) -> dict:
+    if row.get("address") and row.get("city"):
+        return item
+    token = _extract_place_token(item)
+    if not token:
+        return item
+    details = _fetch_place_details(token, api_key, cache)
+    if not details:
+        return item
+    if not row.get("address"):
+        row["address"] = formatted_address_from_item(details)
+    if not row.get("city"):
+        row["city"] = resolve_city(details, row.get("address"), zip_code) or resolve_city(item, row.get("address"), zip_code)
+    return details
+
+
 # ---------------------------------------------------------------------------
 # Per-zip scrape
 # ---------------------------------------------------------------------------
@@ -197,6 +261,7 @@ def _parse_result(item: dict, zip_code: str) -> dict:
 def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connection) -> tuple[int, int, int]:
     """Return (inserted, skipped, geo_rejected) counts for one zip code."""
     inserted = skipped = geo_rejected = 0
+    details_cache: dict[str, dict | None] = {}
 
     for page in range(1, MAX_PAGES + 1):
         params = {
@@ -225,7 +290,8 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
 
         for item in results:
             row = _parse_result(item, zip_code)
-            if not listing_matches_search_zip(item, row.get("address"), zip_code):
+            item_for_match = _hydrate_row_location(row, item, zip_code, api_key, details_cache)
+            if not listing_matches_search_zip(item_for_match, row.get("address"), zip_code):
                 if insert_business(conn, row, "geo_rejected", "geo_zip_mismatch"):
                     geo_rejected += 1
                 else:
