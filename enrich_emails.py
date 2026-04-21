@@ -64,7 +64,8 @@ def ensure_email_column(conn: sqlite3.Connection) -> None:
 def fetch_pending(conn: sqlite3.Connection) -> list[tuple[int, str]]:
     rows = conn.execute(
         "SELECT id, website_url FROM businesses "
-        "WHERE website_url IS NOT NULL AND (email IS NULL OR email = '')"
+        "WHERE website_url IS NOT NULL AND (email IS NULL OR email = '') "
+        "AND COALESCE(pipeline_stage, 'scraped') != 'geo_rejected'"
     ).fetchall()
     return rows
 

@@ -57,12 +57,19 @@ def init_db(path: str) -> sqlite3.Connection:
             review_count INTEGER,
             category     TEXT,
             zip_code     TEXT,
+            pipeline_stage TEXT DEFAULT 'scraped',
+            stage_reason TEXT,
             created_at   TEXT DEFAULT (datetime('now'))
         )
     """)
     cols = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
-    if "city" not in cols:
-        conn.execute("ALTER TABLE businesses ADD COLUMN city TEXT")
+    for col, ddl in [
+        ("city", "ALTER TABLE businesses ADD COLUMN city TEXT"),
+        ("pipeline_stage", "ALTER TABLE businesses ADD COLUMN pipeline_stage TEXT DEFAULT 'scraped'"),
+        ("stage_reason", "ALTER TABLE businesses ADD COLUMN stage_reason TEXT"),
+    ]:
+        if col not in cols:
+            conn.execute(ddl)
     # Composite unique index for dedup logic
     conn.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS idx_phone_url
@@ -76,7 +83,12 @@ def init_db(path: str) -> sqlite3.Connection:
 _db_lock = Lock()
 
 
-def insert_business(conn: sqlite3.Connection, row: dict) -> bool:
+def insert_business(
+    conn: sqlite3.Connection,
+    row: dict,
+    pipeline_stage: str = "scraped",
+    stage_reason: str | None = None,
+) -> bool:
     """Insert row; return True if inserted, False if duplicate."""
     phone = row.get("phone") or None
     url   = row.get("website_url") or None
@@ -91,8 +103,8 @@ def insert_business(conn: sqlite3.Connection, row: dict) -> bool:
                 """
                 INSERT INTO businesses
                     (business_name, address, city, phone, website_url,
-                     rating, review_count, category, zip_code)
-                VALUES (?,?,?,?,?,?,?,?,?)
+                     rating, review_count, category, zip_code, pipeline_stage, stage_reason)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     row.get("business_name"),
@@ -104,6 +116,8 @@ def insert_business(conn: sqlite3.Connection, row: dict) -> bool:
                     row.get("review_count"),
                     row.get("category"),
                     row.get("zip_code"),
+                    pipeline_stage,
+                    stage_reason,
                 ),
             )
             conn.commit()
@@ -210,7 +224,10 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
         for item in results:
             row = _parse_result(item, zip_code)
             if not listing_matches_search_zip(item, row.get("address"), zip_code):
-                geo_rejected += 1
+                if insert_business(conn, row, "geo_rejected", "geo_zip_mismatch"):
+                    geo_rejected += 1
+                else:
+                    skipped += 1
                 continue
             if insert_business(conn, row):
                 inserted += 1

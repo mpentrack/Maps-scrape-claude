@@ -154,7 +154,13 @@ def _parse(item: dict, zip_code: str) -> dict:
     }
 
 
-def _insert(conn: sqlite3.Connection, lock: threading.Lock, row: dict) -> bool:
+def _insert(
+    conn: sqlite3.Connection,
+    lock: threading.Lock,
+    row: dict,
+    pipeline_stage: str = "scraped",
+    stage_reason: str | None = None,
+) -> bool:
     phone = row.get("phone") or None
     url   = row.get("website_url") or None
     if phone is None and url is None:
@@ -163,10 +169,11 @@ def _insert(conn: sqlite3.Connection, lock: threading.Lock, row: dict) -> bool:
         try:
             conn.execute(
                 "INSERT INTO businesses "
-                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, pipeline_stage) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, pipeline_stage, stage_reason) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (row["business_name"], row["address"], row.get("city"), phone, url,
-                 row["rating"], row["review_count"], row["category"], row["zip_code"], "scraped"),
+                 row["rating"], row["review_count"], row["category"], row["zip_code"],
+                 pipeline_stage, stage_reason),
             )
             conn.commit()
             return True
@@ -192,7 +199,10 @@ def _scrape_zip(zip_code: str, keyword: str, api_key: str,
         for item in results:
             row = _parse(item, zip_code)
             if not listing_matches_search_zip(item, row.get("address"), zip_code):
-                geo_rejected += 1
+                if _insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch"):
+                    geo_rejected += 1
+                else:
+                    skipped += 1
                 continue
             if _insert(conn, lock, row):
                 inserted += 1
@@ -591,7 +601,8 @@ def export():
     conn = get_conn()
     rows = conn.execute(
         f"SELECT business_name, address, city, phone, website_url, email, "
-        f"rating, review_count, category, zip_code, pipeline_stage, stage_reason FROM businesses {where} ORDER BY id DESC",
+        f"rating, review_count, category, zip_code, pipeline_stage, stage_reason "
+        f"FROM businesses {where} ORDER BY id DESC",
         params,
     ).fetchall()
     conn.close()
@@ -661,7 +672,7 @@ def advance_pipeline():
 @app.route("/api/stages")
 def stages():
     return jsonify([
-        "scraped", "enriched", "enrich_failed", "clean", "flagged", "clean_failed",
+        "scraped", "geo_rejected", "enriched", "enrich_failed", "clean", "flagged", "clean_failed",
     ])
 
 

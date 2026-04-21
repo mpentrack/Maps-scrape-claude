@@ -392,6 +392,7 @@
             <label class="lbl">Source Stage</label>
             <select class="form-select" id="bulk-stage">
               <option value="scraped">scraped</option>
+              <option value="geo_rejected">geo_rejected (off-target)</option>
               <option value="enrich_failed">enrich_failed</option>
               <option value="enriched">enriched</option>
             </select>
@@ -447,6 +448,7 @@
         <div class="card-body">
           <div class="legend-grid">
             <div class="legend-item"><span class="chip">scraped</span> <b>Step 1 complete:</b> lead captured from Maps API.</div>
+            <div class="legend-item"><span class="chip">geo_rejected</span> <b>Off-target:</b> API hit for your search ZIP, but address/ZIP fields don’t match our location check (still saved so you can audit).</div>
             <div class="legend-item"><span class="chip">enriched</span> <b>Step 2 complete:</b> email found from website scrape.</div>
             <div class="legend-item"><span class="chip">enrich_failed</span> <b>Step 2 failed:</b> no email found or site inaccessible.</div>
             <div class="legend-item"><span class="chip">clean</span> <b>Step 3 complete:</b> passed quality checks.</div>
@@ -521,7 +523,7 @@
                 <th>Category</th>
                 <th>City</th>
                 <th>Zip</th>
-                <th>Stage</th>
+                <th>Stage / reason</th>
               </tr>
             </thead>
             <tbody id="leads-tbody">
@@ -642,7 +644,7 @@ async function refreshJobs() {
           <span>${j.processed}/${j.total} zips</span>
           <span style="color:var(--green)">+${j.inserted.toLocaleString()} new</span>
           <span>${j.duplicates.toLocaleString()} dup</span>
-          ${(j.geo_rejected != null && j.geo_rejected > 0) ? `<span style="color:var(--orange)">${j.geo_rejected.toLocaleString()} off-target</span>` : ''}
+          ${(j.geo_rejected != null && j.geo_rejected > 0) ? `<span style="color:var(--orange)" title="Rows saved with stage geo_rejected — filter Pipeline Stage">` + j.geo_rejected.toLocaleString() + ` off-target</span>` : ''}
           ${j.enriched ? `<span>enriched ${j.enriched.enriched || 0}/${j.enriched.checked || 0}</span>` : ''}
           ${j.cleaned ? `<span>clean ${j.cleaned.clean || 0}/${j.cleaned.checked || 0}</span>` : ''}
           <span style="margin-left:auto">${pct}%</span>
@@ -767,7 +769,7 @@ async function loadLeads(page) {
       <td><span class="chip">${esc(r.category||'—')}</span></td>
       <td style="color:var(--muted)">${esc(r.city||'—')}</td>
       <td style="color:var(--muted)">${esc(r.zip_code||'—')}</td>
-      <td><span class="chip">${esc(r.pipeline_stage||'—')}</span></td>
+      <td><span class="chip" title="${esc(r.stage_reason || '')}">${esc(r.pipeline_stage||'—')}${r.stage_reason ? ' · ' + esc(r.stage_reason) : ''}</span></td>
     </tr>`).join('');
 }
 
