@@ -119,6 +119,8 @@ class EmailScrapeResult:
     """Set when a stored address is chosen (respecting generic fallback policy)."""
     stage_reason: str | None
     """When email is None: 'no_email_found' or 'only_generic_email'."""
+    city: str | None = None
+    """City name inferred from the business website, when not already known."""
 
 
 # Consumer / free-mail hosts — kept as candidates but ranked below same-site addresses.
@@ -134,6 +136,90 @@ _JUNK_EMAIL_DOMAIN_SUFFIXES = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
     ".css", ".js", ".json", ".woff", ".woff2",
 )
+
+
+# ---------------------------------------------------------------------------
+# City extraction helpers
+# ---------------------------------------------------------------------------
+
+_US_STATES = frozenset({
+    "AL","AK","AZ","AR","CA","CO","CT","DE","FL","GA","HI","ID","IL","IN",
+    "IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV",
+    "NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN",
+    "TX","UT","VT","VA","WA","WV","WI","WY","DC",
+})
+
+# Common non-city words that sometimes appear as addressLocality in structured data.
+_CITY_STOP_WORDS: frozenset[str] = frozenset({
+    "usa", "united states", "us", "america", "nationwide", "national",
+    "online", "virtual", "remote", "service area", "your area",
+})
+
+# "City Name, ST" — anchored to a 2-letter state code.
+_CITY_STATE_RE = re.compile(
+    r"\b([A-Z][a-zA-Z](?:[a-zA-Z .'\-]{0,30}?)[a-zA-Z])\s*,\s*([A-Z]{2})\b"
+)
+
+
+def _city_from_jsonld(obj: Any) -> str | None:
+    """Recursively search a parsed JSON-LD object for addressLocality."""
+    if isinstance(obj, dict):
+        loc = obj.get("addressLocality") or obj.get("address", {})
+        if isinstance(loc, str) and loc.strip():
+            candidate = loc.strip().title()
+            if candidate.lower() not in _CITY_STOP_WORDS and len(candidate) >= 2:
+                return candidate
+        if isinstance(loc, dict):
+            sub = loc.get("addressLocality")
+            if isinstance(sub, str) and sub.strip():
+                candidate = sub.strip().title()
+                if candidate.lower() not in _CITY_STOP_WORDS and len(candidate) >= 2:
+                    return candidate
+        for v in obj.values():
+            result = _city_from_jsonld(v)
+            if result:
+                return result
+    elif isinstance(obj, list):
+        for item in obj:
+            result = _city_from_jsonld(item)
+            if result:
+                return result
+    return None
+
+
+def extract_city_from_html(html: str) -> str | None:
+    """Return the most likely city name for the business, or None."""
+    soup = BeautifulSoup(html, "html.parser")
+
+    # 1. JSON-LD structured data — most reliable source.
+    for script in soup.find_all("script", attrs={"type": lambda t: t and "ld+json" in str(t).lower()}):
+        raw = (script.string or script.get_text() or "").strip()
+        if not raw:
+            continue
+        try:
+            result = _city_from_jsonld(json.loads(raw))
+            if result:
+                return result
+        except json.JSONDecodeError:
+            continue
+
+    # 2. HTML microdata — itemprop="addressLocality"
+    for tag in soup.find_all(attrs={"itemprop": "addressLocality"}):
+        text = (tag.get("content") or tag.get_text() or "").strip()
+        if text and text.lower() not in _CITY_STOP_WORDS and len(text) >= 2:
+            return text.title()
+
+    # 3. Regex scan for "City, ST" pattern in visible text.
+    for s in soup(["script", "style", "noscript"]):
+        s.decompose()
+    page_text = soup.get_text(" ")
+    for m in _CITY_STATE_RE.finditer(page_text):
+        city_candidate = m.group(1).strip()
+        state_candidate = m.group(2).upper()
+        if state_candidate in _US_STATES and city_candidate.lower() not in _CITY_STOP_WORDS:
+            return city_candidate.title()
+
+    return None
 
 
 def normalize_website_url(url: str) -> str:
@@ -347,26 +433,29 @@ def scrape_email_for_website(
     urls = [base] + [urljoin(base + "/", p.lstrip("/")) for p in SUBPAGES]
     all_emails: list[str] = []
     any_page_loaded = False
+    city_found: str | None = None
     for url in urls:
         html = http_get_text(session, url)
         if html is None:
             continue
         any_page_loaded = True
         all_emails.extend(extract_email_candidates(html))
+        if city_found is None:
+            city_found = extract_city_from_html(html)
         best = pick_best_email(
             all_emails,
             allow_generic_fallback=allow_generic_fallback,
             website_url=website_url,
         )
         if best and (allow_generic_fallback or not is_generic_email(best)):
-            return EmailScrapeResult(best, None)
+            return EmailScrapeResult(best, None, city_found)
     best = pick_best_email(
         all_emails,
         allow_generic_fallback=allow_generic_fallback,
         website_url=website_url,
     )
     if best:
-        return EmailScrapeResult(best, None)
+        return EmailScrapeResult(best, None, city_found)
 
     # WHOIS fallback — often surfaces the owner's direct registrant email.
     try:
@@ -376,13 +465,13 @@ def scrape_email_for_website(
     if hostname:
         w_email = whois_email_for_domain(hostname)
         if w_email and (allow_generic_fallback or not is_generic_email(w_email)):
-            return EmailScrapeResult(w_email, None)
+            return EmailScrapeResult(w_email, None, city_found)
 
     if not any_page_loaded:
-        return EmailScrapeResult(None, "no_email_found")
+        return EmailScrapeResult(None, "no_email_found", city_found)
     plausible = [e for e in all_emails if is_plausible_email(e)]
     if not plausible:
-        return EmailScrapeResult(None, "no_email_found")
+        return EmailScrapeResult(None, "no_email_found", city_found)
     if not allow_generic_fallback and all(is_generic_email(e) for e in plausible):
-        return EmailScrapeResult(None, "only_generic_email")
-    return EmailScrapeResult(None, "no_email_found")
+        return EmailScrapeResult(None, "only_generic_email", city_found)
+    return EmailScrapeResult(None, "no_email_found", city_found)

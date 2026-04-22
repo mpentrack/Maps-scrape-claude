@@ -542,6 +542,11 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
                 )
                 with result_lock:
                     no_email += 1
+            if res.city:
+                conn.execute(
+                    "UPDATE businesses SET city=? WHERE id=? AND (city IS NULL OR TRIM(city)='')",
+                    (res.city, row_id),
+                )
             conn.commit()
     return {"checked": len(rows), "enriched": enriched, "no_email": no_email}
 
