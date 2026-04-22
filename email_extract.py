@@ -49,7 +49,7 @@ _WHOIS_JUNK_DOMAINS: frozenset[str] = frozenset({
 # addresses — never real owner emails.
 _WHOIS_JUNK_KEYWORDS: frozenset[str] = frozenset({
     "abuse", "complaint", "icann",
-    "domain", "web.com", "example", "sample", "verisign", "whois", "email.com",
+    "domain@", "web.com", "example", "sample", "verisign", "whois", "email.com",
 })
 
 

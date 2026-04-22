@@ -28,7 +28,9 @@ from zip_geocode import us_zip_latlng
 
 API_HOST = "maps-data.p.rapidapi.com"
 API_BASE = f"https://{API_HOST}"
-DB_PATH = "businesses.db"
+# Use /data (Railway persistent volume) when mounted, otherwise current directory.
+_DB_DIR = "/data" if os.path.isdir("/data") else "."
+DB_PATH = os.environ.get("DB_PATH", os.path.join(_DB_DIR, "businesses.db"))
 MAX_WORKERS = 10
 PAGE_SIZE = 20          # results per page (API default)
 MAX_PAGES = 10          # safety cap per zip

@@ -31,7 +31,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 log = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
-DB_PATH     = os.environ.get("DB_PATH", "businesses.db")
+# Use /data (Railway persistent volume) when mounted, otherwise current directory.
+_DB_DIR = "/data" if os.path.isdir("/data") else "."
+DB_PATH = os.environ.get("DB_PATH", os.path.join(_DB_DIR, "businesses.db"))
 API_HOST    = "maps-data.p.rapidapi.com"
 API_BASE    = f"https://{API_HOST}"
 PAGE_SIZE   = 20
