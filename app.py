@@ -695,13 +695,16 @@ def start_job():
 def stats():
     try:
         conn  = get_conn()
-        total = conn.execute("SELECT COUNT(*) FROM businesses").fetchone()[0]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM businesses WHERE pipeline_stage != 'archived'"
+        ).fetchone()[0]
         with_email = conn.execute(
-            "SELECT COUNT(*) FROM businesses WHERE email IS NOT NULL AND email != ''"
+            "SELECT COUNT(*) FROM businesses WHERE email IS NOT NULL AND email != '' AND pipeline_stage != 'archived'"
         ).fetchone()[0]
         categories = conn.execute(
             "SELECT category, COUNT(*) cnt FROM businesses "
-            "WHERE category IS NOT NULL GROUP BY category ORDER BY cnt DESC LIMIT 12"
+            "WHERE category IS NOT NULL AND pipeline_stage != 'archived' "
+            "GROUP BY category ORDER BY cnt DESC LIMIT 12"
         ).fetchall()
         stage_counts = conn.execute(
             "SELECT pipeline_stage, COUNT(*) cnt FROM businesses GROUP BY pipeline_stage ORDER BY cnt DESC"
@@ -730,6 +733,37 @@ def categories():
         return jsonify([])
 
 
+@app.route("/api/leads/archive", methods=["POST"])
+def archive_leads():
+    data        = request.get_json(force=True) or {}
+    min_rating  = float(data.get("min_rating",  0) or 0)
+    min_reviews = int(  data.get("min_reviews", 0) or 0)
+    has_email   = str(  data.get("has_email", "false")).lower() == "true"
+    category    = (data.get("category") or "").strip()
+    stage       = (data.get("stage")    or "").strip()
+
+    where, params = _build_where(min_rating, min_reviews, has_email, category, stage)
+
+    # Never silently re-archive already-archived rows unless the user
+    # explicitly filtered to the archived stage.
+    if not stage:
+        extra = "pipeline_stage != 'archived'"
+        where = f"WHERE {extra}" if not where else f"{where} AND {extra}"
+
+    try:
+        conn   = get_conn()
+        result = conn.execute(
+            f"UPDATE businesses SET pipeline_stage = 'archived' {where}",
+            params,
+        )
+        count = result.rowcount
+        conn.commit()
+        conn.close()
+        return jsonify({"ok": True, "archived": count})
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/leads")
 def leads():
     page        = request.args.get("page",        1,     type=int)
@@ -741,6 +775,11 @@ def leads():
     stage       = request.args.get("stage",       "")
 
     where, params = _build_where(min_rating, min_reviews, has_email, category, stage)
+    # Hide archived records from the default view; show them only when
+    # the user explicitly filters to the "archived" stage.
+    if not stage:
+        extra = "pipeline_stage != 'archived'"
+        where = f"WHERE {extra}" if not where else f"{where} AND {extra}"
     offset = (page - 1) * per_page
 
     try:
@@ -771,6 +810,9 @@ def export():
     stage       = request.args.get("stage",       "")
 
     where, params = _build_where(min_rating, min_reviews, has_email, category, stage)
+    if not stage:
+        extra = "pipeline_stage != 'archived'"
+        where = f"WHERE {extra}" if not where else f"{where} AND {extra}"
 
     conn = get_conn()
     rows = conn.execute(
@@ -848,6 +890,7 @@ def stages():
     return jsonify([
         "scraped", "geo_rejected", "no_website_prospect",
         "enriched", "enrich_failed", "clean", "flagged", "clean_failed",
+        "archived",
     ])
 
 

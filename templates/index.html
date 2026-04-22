@@ -133,6 +133,19 @@
     }
     .btn-ghost:hover { background: var(--border); }
     .btn-ghost:disabled { opacity: .4; cursor: not-allowed; }
+    .btn-archive {
+      background: transparent;
+      border: 1px solid var(--orange);
+      color: var(--orange);
+      font-weight: 700;
+      font-size: 0.8rem;
+      border-radius: 6px;
+      padding: 0.35rem 0.85rem;
+      cursor: pointer;
+      transition: opacity .15s;
+    }
+    .btn-archive:hover { opacity: .75; }
+    .btn-archive:disabled { opacity: .4; cursor: not-allowed; }
 
     /* ── Tabs (inline) ── */
     .tab-row { display: flex; gap: 4px; }
@@ -455,6 +468,7 @@
             <div class="legend-item"><span class="chip">clean</span> <b>Step 3 complete:</b> passed quality checks.</div>
             <div class="legend-item"><span class="chip">flagged</span> <b>Step 3 review:</b> low trust or excluded criteria.</div>
             <div class="legend-item"><span class="chip">clean_failed</span> <b>Step 3 failed:</b> missing required data.</div>
+            <div class="legend-item"><span class="chip">archived</span> <b>Archived:</b> hidden from the default view and export. Use the Archive button to move leads here after exporting. Filter by this stage to see or restore them.</div>
           </div>
         </div>
       </div>
@@ -463,9 +477,15 @@
       <div class="card">
         <div class="card-hd">
           <span>Leads</span>
-          <button class="btn-green" onclick="exportCSV()">
-            <i class="bi bi-download"></i>&nbsp;Export CSV
-          </button>
+          <div style="display:flex;gap:6px;align-items:center">
+            <button class="btn-archive" id="btn-archive" onclick="archiveLeads()"
+              title="Move leads matching current filters to archived — hidden from default view but kept in the database">
+              <i class="bi bi-archive"></i>&nbsp;Archive
+            </button>
+            <button class="btn-green" onclick="exportCSV()">
+              <i class="bi bi-download"></i>&nbsp;Export CSV
+            </button>
+          </div>
         </div>
 
         <!-- Filter bar -->
@@ -814,6 +834,55 @@ async function advanceStage(action) {
   msg.textContent = `${action} finished: ${JSON.stringify(data.result)}`;
   await refreshStats();
   await loadLeads(currentPage);
+}
+
+// ── Archive ────────────────────────────────────────────────────────────────
+async function archiveLeads() {
+  const stageFilter = document.getElementById('f-stage').value;
+  const label = stageFilter || 'all active stages';
+  if (!confirm(
+    `Archive leads matching current filters (stage: ${label})?\n\n` +
+    `They will be hidden from the default view and excluded from exports, ` +
+    `but stay in the database for dedup protection.\n\n` +
+    `To view or restore them later, filter Pipeline Stage to "archived".`
+  )) return;
+
+  const btn = document.getElementById('btn-archive');
+  btn.disabled = true;
+
+  try {
+    const res = await fetch('/api/leads/archive', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        min_rating:  document.getElementById('f-rating').value,
+        min_reviews: document.getElementById('f-reviews').value,
+        has_email:   document.getElementById('f-email').checked,
+        category:    document.getElementById('f-category').value,
+        stage:       stageFilter,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      alert('Archive failed: ' + (data.error || 'Unknown error'));
+      return;
+    }
+    const orig = btn.innerHTML;
+    btn.innerHTML = `<i class="bi bi-check2"></i>&nbsp;${data.archived.toLocaleString()} archived`;
+    btn.style.color = 'var(--green)';
+    btn.style.borderColor = 'var(--green)';
+    setTimeout(() => {
+      btn.innerHTML = orig;
+      btn.style.color = '';
+      btn.style.borderColor = '';
+      btn.disabled = false;
+    }, 3000);
+    await refreshStats();
+    await loadLeads(1);
+  } catch (e) {
+    alert('Archive failed: ' + e);
+    btn.disabled = false;
+  }
 }
 
 // ── Helpers ────────────────────────────────────────────────────────────────
