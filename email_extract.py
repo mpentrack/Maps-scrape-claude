@@ -45,6 +45,9 @@ _WHOIS_JUNK_DOMAINS: frozenset[str] = frozenset({
     "godaddy.com", "above.com", "perfectprivacy.com",
 })
 
+# Substrings that identify ICANN-mandated abuse/complaint contacts — never real owner emails.
+_WHOIS_JUNK_KEYWORDS: frozenset[str] = frozenset({"abuse", "complaint", "icann"})
+
 
 def whois_email_for_domain(domain: str) -> str | None:
     """Return the registrant email from WHOIS, skipping privacy shields.
@@ -69,6 +72,8 @@ def whois_email_for_domain(domain: str) -> str | None:
                 continue
             e = e.strip().lower()
             if e.split("@")[-1] in _WHOIS_JUNK_DOMAINS:
+                continue
+            if any(kw in e for kw in _WHOIS_JUNK_KEYWORDS):
                 continue
             if is_plausible_email(e):
                 return e
