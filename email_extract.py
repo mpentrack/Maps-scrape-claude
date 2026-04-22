@@ -22,6 +22,61 @@ EMAIL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Patterns used to expand human-readable email obfuscations before regex matching.
+# e.g. "john [at] hvacpros [dot] com" → "john@hvacpros.com"
+_OBFUSCATED_AT = re.compile(r"\s*[\[\(]at[\]\)]\s*|\s+at\s+(?=[a-zA-Z0-9])", re.IGNORECASE)
+_OBFUSCATED_DOT = re.compile(r"\s*[\[\(]dot[\]\)]\s*", re.IGNORECASE)
+
+
+def _normalize_obfuscated(text: str) -> str:
+    """Expand [at]/(at)/[dot]/(dot) obfuscations so EMAIL_RE can match them."""
+    t = _OBFUSCATED_AT.sub("@", text)
+    t = _OBFUSCATED_DOT.sub(".", t)
+    return t
+
+
+# Privacy-shield / registrar-proxy domains that appear in WHOIS but are useless as contacts.
+_WHOIS_JUNK_DOMAINS: frozenset[str] = frozenset({
+    "privacyguardian.org", "domainsbyproxy.com", "whoisguard.com",
+    "contactprivacy.com", "whoisprivacy.com", "privacyprotect.org",
+    "networksolutionsprivate.com", "domainprivacygroup.com",
+    "withheldforprivacy.com", "anonymize.com", "domains.google.com",
+    "namecheaphosting.com", "registrar-servers.com", "hugedomains.com",
+    "godaddy.com", "above.com", "perfectprivacy.com",
+})
+
+
+def whois_email_for_domain(domain: str) -> str | None:
+    """Return the registrant email from WHOIS, skipping privacy shields.
+
+    Returns None on any failure so callers never need to handle exceptions.
+    The `python-whois` package is an optional dependency; if missing this
+    silently returns None.
+    """
+    if not domain:
+        return None
+    domain = domain.lower().strip().lstrip("www.")
+    try:
+        import whois  # optional: python-whois
+        w = whois.whois(domain)
+        emails = w.emails
+        if isinstance(emails, str):
+            emails = [emails]
+        if not isinstance(emails, list):
+            return None
+        for e in emails:
+            if not isinstance(e, str) or "@" not in e:
+                continue
+            e = e.strip().lower()
+            if e.split("@")[-1] in _WHOIS_JUNK_DOMAINS:
+                continue
+            if is_plausible_email(e):
+                return e
+    except Exception:
+        pass
+    return None
+
+
 # Local parts treated as generic / role inboxes — prefer any other address on the same site.
 GENERIC_LOCAL_PREFIXES: frozenset[str] = frozenset({
     "info", "hello", "support", "contact", "sales", "admin",
@@ -40,6 +95,9 @@ USER_AGENT = (
 SUBPAGES = [
     "/contact", "/contact-us", "/about", "/about-us",
     "/team", "/meet-the-team", "/location", "/locations",
+    "/staff", "/our-team", "/people", "/bios", "/leadership",
+    "/owner", "/get-in-touch", "/estimate", "/free-estimate",
+    "/schedule", "/contact.html", "/about.html",
 ]
 
 REQUEST_TIMEOUT = 5
@@ -220,6 +278,12 @@ def extract_email_candidates(html: str) -> list[str]:
     for m in EMAIL_RE.finditer(text):
         candidates.append(m.group(0).lower())
 
+    # Second pass on normalized text to catch obfuscated addresses.
+    normalized = _normalize_obfuscated(text)
+    if normalized != text:
+        for m in EMAIL_RE.finditer(normalized):
+            candidates.append(m.group(0).lower())
+
     html_remain = str(soup)
     for m in EMAIL_RE.finditer(html_remain):
         candidates.append(m.group(0).lower())
@@ -294,6 +358,17 @@ def scrape_email_for_website(
     )
     if best:
         return EmailScrapeResult(best, None)
+
+    # WHOIS fallback — often surfaces the owner's direct registrant email.
+    try:
+        hostname = urlparse(base).hostname or ""
+    except ValueError:
+        hostname = ""
+    if hostname:
+        w_email = whois_email_for_domain(hostname)
+        if w_email and (allow_generic_fallback or not is_generic_email(w_email)):
+            return EmailScrapeResult(w_email, None)
+
     if not any_page_loaded:
         return EmailScrapeResult(None, "no_email_found")
     plausible = [e for e in all_emails if is_plausible_email(e)]

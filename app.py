@@ -298,8 +298,8 @@ def _scrape_zip(
     conn: sqlite3.Connection,
     lock: threading.Lock,
     job_id: str | None = None,
-) -> tuple[int, int, int]:
-    inserted = skipped = geo_rejected = 0
+) -> tuple[int, int, int, int]:
+    inserted = skipped = geo_rejected = no_website = 0
     details_cache: dict[str, dict | None] = {}
     query = _query_for_zip(keyword, zip_code)
     coords = us_zip_latlng(zip_code)
@@ -368,12 +368,17 @@ def _scrape_zip(
                 else:
                     skipped += 1
                 continue
-            if _insert(conn, lock, row):
+            if not row.get("website_url"):
+                if _insert(conn, lock, row, "no_website_prospect", "no_website"):
+                    no_website += 1
+                else:
+                    skipped += 1
+            elif _insert(conn, lock, row):
                 inserted += 1
             else:
                 skipped += 1
         log.info(
-            "[scrape-job %s] zip=%s page=%d api_rows=%d cumulative new=%d dup=%d off_target=%d query=%r",
+            "[scrape-job %s] zip=%s page=%d api_rows=%d cumulative new=%d dup=%d off_target=%d no_website=%d query=%r",
             job_id or "-",
             zip_code,
             page,
@@ -381,19 +386,21 @@ def _scrape_zip(
             inserted,
             skipped,
             geo_rejected,
+            no_website,
             query,
         )
         if len(results) < PAGE_SIZE:
             break
     log.info(
-        "[scrape-job %s] zip=%s finished cumulative new=%d dup=%d off_target=%d",
+        "[scrape-job %s] zip=%s finished cumulative new=%d dup=%d off_target=%d no_website=%d",
         job_id or "-",
         zip_code,
         inserted,
         skipped,
         geo_rejected,
+        no_website,
     )
-    return inserted, skipped, geo_rejected
+    return inserted, skipped, geo_rejected, no_website
 
 
 def _run_job(job_id: str, api_key: str) -> None:
@@ -423,15 +430,16 @@ def _run_job(job_id: str, api_key: str) -> None:
                 for z in job["zip_codes"]
             }
             for future in as_completed(futures):
-                ins, skp, geo = future.result()
+                ins, skp, geo, nw = future.result()
                 with _jobs_lock:
-                    job["inserted"]      += ins
-                    job["duplicates"]    += skp
-                    job["geo_rejected"]  = job.get("geo_rejected", 0) + geo
-                    job["processed"]     += 1
+                    job["inserted"]           += ins
+                    job["duplicates"]         += skp
+                    job["geo_rejected"]        = job.get("geo_rejected", 0) + geo
+                    job["no_website_prospect"] = job.get("no_website_prospect", 0) + nw
+                    job["processed"]          += 1
                 _job_event(
                     job_id, "info", "scrape",
-                    f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup, {geo} off-target).",
+                    f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup, {geo} off-target, {nw} no-website).",
                 )
         if job.get("run_mode") == "full_pipeline":
             _job_event(job_id, "info", "enrich", "Starting enrichment (in-target scraped rows).")
@@ -461,11 +469,12 @@ def _run_job(job_id: str, api_key: str) -> None:
             job["status"] = "completed"
             fin = dict(job)
         log.info(
-            "[scrape-job %s] completed new=%d dup=%d off_target=%d mode=%s",
+            "[scrape-job %s] completed new=%d dup=%d off_target=%d no_website=%d mode=%s",
             job_id,
             fin.get("inserted", 0),
             fin.get("duplicates", 0),
             fin.get("geo_rejected", 0),
+            fin.get("no_website_prospect", 0),
             fin.get("run_mode", "scrape_only"),
         )
         _job_event(job_id, "info", "job", "Job completed.")
@@ -538,15 +547,12 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
 def _classify_clean_stage(row: sqlite3.Row) -> tuple[str, str | None]:
     email = (row["email"] or "").strip().lower()
     name = (row["business_name"] or "").lower()
-    review_count = row["review_count"]
     if not email:
         return "clean_failed", "missing_email"
     if FLAG_FREE_EMAIL_DOMAINS and email.split("@")[-1] in PERSONAL_DOMAINS:
         return "flagged", "personal_email_domain"
     if "permanently closed" in name:
         return "flagged", "permanently_closed"
-    if review_count is None or review_count < 5:
-        return "flagged", "low_review_count"
     return "clean", None
 
 
@@ -655,23 +661,24 @@ def start_job():
     if run_mode not in {"scrape_only", "full_pipeline"}:
         return jsonify({"error": "Invalid run mode"}), 400
     job = {
-        "id":           str(uuid.uuid4())[:8],
-        "keyword":      keyword,
-        "state":        state,
-        "zip_codes":    zips,
-        "status":       "pending",
-        "total":        len(zips),
-        "processed":    0,
-        "inserted":     0,
-        "duplicates":   0,
-        "geo_rejected": 0,
-        "started_at":   datetime.utcnow().isoformat(),
-        "completed_at": None,
-        "error":        None,
-        "run_mode":     run_mode,
-        "enriched":     None,
-        "cleaned":      None,
-        "events":       [],
+        "id":                  str(uuid.uuid4())[:8],
+        "keyword":             keyword,
+        "state":               state,
+        "zip_codes":           zips,
+        "status":              "pending",
+        "total":               len(zips),
+        "processed":           0,
+        "inserted":            0,
+        "duplicates":          0,
+        "geo_rejected":        0,
+        "no_website_prospect": 0,
+        "started_at":          datetime.utcnow().isoformat(),
+        "completed_at":        None,
+        "error":               None,
+        "run_mode":            run_mode,
+        "enriched":            None,
+        "cleaned":             None,
+        "events":              [],
     }
 
     with _jobs_lock:
@@ -837,7 +844,8 @@ def advance_pipeline():
 @app.route("/api/stages")
 def stages():
     return jsonify([
-        "scraped", "geo_rejected", "enriched", "enrich_failed", "clean", "flagged", "clean_failed",
+        "scraped", "geo_rejected", "no_website_prospect",
+        "enriched", "enrich_failed", "clean", "flagged", "clean_failed",
     ])
 
 

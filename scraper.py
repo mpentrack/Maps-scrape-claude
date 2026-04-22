@@ -282,9 +282,9 @@ def _hydrate_row_location(row: dict, item: dict, zip_code: str, api_key: str, ca
 # Per-zip scrape
 # ---------------------------------------------------------------------------
 
-def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connection) -> tuple[int, int, int]:
-    """Return (inserted, skipped, geo_rejected) counts for one zip code."""
-    inserted = skipped = geo_rejected = 0
+def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connection) -> tuple[int, int, int, int]:
+    """Return (inserted, skipped, geo_rejected, no_website) counts for one zip code."""
+    inserted = skipped = geo_rejected = no_website = 0
     details_cache: dict[str, dict | None] = {}
     query = _query_for_zip(keyword, zip_code)
     coords = us_zip_latlng(zip_code)
@@ -338,20 +338,25 @@ def scrape_zip(zip_code: str, keyword: str, api_key: str, conn: sqlite3.Connecti
                 else:
                     skipped += 1
                 continue
-            if insert_business(conn, row):
+            if not row.get("website_url"):
+                if insert_business(conn, row, "no_website_prospect", "no_website"):
+                    no_website += 1
+                else:
+                    skipped += 1
+            elif insert_business(conn, row):
                 inserted += 1
             else:
                 skipped += 1
 
         log.info(
-            "ZIP %-10s page %2d — +%d new, %d dup, %d off-target",
-            zip_code, page, inserted, skipped, geo_rejected,
+            "ZIP %-10s page %2d — +%d new, %d dup, %d off-target, %d no-website",
+            zip_code, page, inserted, skipped, geo_rejected, no_website,
         )
 
         if len(results) < PAGE_SIZE:
             break  # last page
 
-    return inserted, skipped, geo_rejected
+    return inserted, skipped, geo_rejected, no_website
 
 
 # ---------------------------------------------------------------------------
@@ -386,7 +391,7 @@ def main():
     zips = load_zips(args.csv)
     log.info("Loaded %d zip codes. Keyword: '%s'", len(zips), args.keyword)
 
-    total_inserted = total_skipped = total_geo = 0
+    total_inserted = total_skipped = total_geo = total_nw = 0
     lock = Lock()
 
     def task(zip_code):
@@ -397,17 +402,18 @@ def main():
         for future in as_completed(futures):
             z = futures[future]
             try:
-                _, (ins, skp, geo) = future.result()
+                _, (ins, skp, geo, nw) = future.result()
                 with lock:
                     total_inserted += ins
                     total_skipped  += skp
                     total_geo      += geo
+                    total_nw       += nw
             except Exception as exc:
                 log.error("ZIP %s failed: %s", z, exc)
 
     log.info(
-        "Done. Total inserted: %d | duplicates skipped: %d | off-target skipped: %d | DB: %s",
-        total_inserted, total_skipped, total_geo, args.db,
+        "Done. Total inserted: %d | duplicates skipped: %d | off-target skipped: %d | no-website: %d | DB: %s",
+        total_inserted, total_skipped, total_geo, total_nw, args.db,
     )
     conn.close()
 
