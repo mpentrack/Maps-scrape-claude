@@ -545,10 +545,11 @@
                 <th>City</th>
                 <th>Zip</th>
                 <th>Stage / reason</th>
+                <th>Scraped</th>
               </tr>
             </thead>
             <tbody id="leads-tbody">
-              <tr><td colspan="9"><div class="empty-msg">No leads yet.</div></td></tr>
+              <tr><td colspan="10"><div class="empty-msg">No leads yet.</div></td></tr>
             </tbody>
           </table>
         </div>
@@ -773,7 +774,7 @@ async function loadLeads(page) {
 
   const tbody = document.getElementById('leads-tbody');
   if (!d.leads || !d.leads.length) {
-    tbody.innerHTML = '<tr><td colspan="9"><div class="empty-msg">No leads match your filters.</div></td></tr>';
+    tbody.innerHTML = '<tr><td colspan="10"><div class="empty-msg">No leads match your filters.</div></td></tr>';
     return;
   }
 
@@ -791,6 +792,7 @@ async function loadLeads(page) {
       <td style="color:var(--muted)">${esc(r.city||'—')}</td>
       <td style="color:var(--muted)">${esc(r.zip_code||'—')}</td>
       <td><span class="chip" title="${esc(r.stage_reason || '')}">${esc(r.pipeline_stage||'—')}${r.stage_reason ? ' · ' + esc(r.stage_reason) : ''}</span></td>
+      <td style="white-space:nowrap;color:var(--muted);font-size:0.75rem">${esc(r.created_at ? r.created_at.slice(5,16).replace('T',' ') : '—')}</td>
     </tr>`).join('');
 }
 

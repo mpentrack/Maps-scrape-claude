@@ -12,8 +12,10 @@ import os
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime
 from pathlib import Path
 from threading import Lock
+from zoneinfo import ZoneInfo
 
 import requests
 
@@ -31,6 +33,13 @@ API_BASE = f"https://{API_HOST}"
 # Use /data (Railway persistent volume) when mounted, otherwise current directory.
 _DB_DIR = "/data" if os.path.isdir("/data") else "."
 DB_PATH = os.environ.get("DB_PATH", os.path.join(_DB_DIR, "businesses.db"))
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _now_eastern() -> str:
+    return datetime.now(tz=_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+
+
 MAX_WORKERS = 10
 PAGE_SIZE = 20          # results per page (API default)
 MAX_PAGES = 10          # safety cap per zip
@@ -117,8 +126,8 @@ def insert_business(
                 """
                 INSERT INTO businesses
                     (business_name, address, city, phone, website_url,
-                     rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+                     rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason, created_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     row.get("business_name"),
@@ -133,6 +142,7 @@ def insert_business(
                     row.get("search_zip"),
                     pipeline_stage,
                     stage_reason,
+                    _now_eastern(),
                 ),
             )
             conn.commit()

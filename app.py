@@ -14,6 +14,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 import requests
@@ -34,6 +35,11 @@ log = logging.getLogger(__name__)
 # Use /data (Railway persistent volume) when mounted, otherwise current directory.
 _DB_DIR = "/data" if os.path.isdir("/data") else "."
 DB_PATH = os.environ.get("DB_PATH", os.path.join(_DB_DIR, "businesses.db"))
+_EASTERN = ZoneInfo("America/New_York")
+
+
+def _now_eastern() -> str:
+    return datetime.now(tz=_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
 API_HOST    = "maps-data.p.rapidapi.com"
 API_BASE    = f"https://{API_HOST}"
 PAGE_SIZE   = 20
@@ -116,6 +122,7 @@ def init_db() -> None:
         "stage_reason": "ALTER TABLE businesses ADD COLUMN stage_reason TEXT",
         "enriched_at": "ALTER TABLE businesses ADD COLUMN enriched_at TEXT",
         "cleaned_at": "ALTER TABLE businesses ADD COLUMN cleaned_at TEXT",
+        "created_at": "ALTER TABLE businesses ADD COLUMN created_at TEXT",
     }.items():
         if col not in cols:
             conn.execute(ddl)
@@ -281,11 +288,11 @@ def _insert(
         try:
             conn.execute(
                 "INSERT INTO businesses "
-                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row["business_name"], row["address"], row.get("city"), phone, url,
                  row["rating"], row["review_count"], row["category"], row["zip_code"], row.get("search_zip"),
-                 pipeline_stage, stage_reason),
+                 pipeline_stage, stage_reason, _now_eastern()),
             )
             conn.commit()
             return True
@@ -822,7 +829,7 @@ def export():
     conn = get_conn()
     rows = conn.execute(
         f"SELECT business_name, address, city, phone, website_url, email, "
-        f"rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason "
+        f"rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason, created_at "
         f"FROM businesses {where} ORDER BY id DESC",
         params,
     ).fetchall()
@@ -832,7 +839,7 @@ def export():
         buf = io.StringIO()
         w   = csv.writer(buf)
         w.writerow(["business_name","address","city","phone","website_url","email",
-                    "rating","review_count","category","zip_code","search_zip","pipeline_stage","stage_reason"])
+                    "rating","review_count","category","zip_code","search_zip","pipeline_stage","stage_reason","scraped_at_et"])
         for row in rows:
             w.writerow(list(row))
         yield buf.getvalue()
