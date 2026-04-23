@@ -719,6 +719,12 @@ async function refreshStats() {
   document.getElementById('nb-emails').textContent = d.with_email.toLocaleString();
   document.getElementById('nb-pct').textContent    = pct + '%';
 
+  // Stage filter — always update so "archived" is selectable even when all records are archived
+  const stageSel = document.getElementById('f-stage');
+  const curStage = stageSel.value;
+  stageSel.innerHTML = '<option value="">All stages</option>' +
+    (d.stages || []).map(s => `<option value="${esc(s.name)}"${s.name===curStage?' selected':''}>${esc(s.name)} (${s.count})</option>`).join('');
+
   // Category bars
   const catsEl = document.getElementById('cats-body');
   if (!d.categories.length) {
@@ -738,11 +744,6 @@ async function refreshStats() {
   const cur = sel.value;
   sel.innerHTML = '<option value="">All categories</option>' +
     d.categories.map(c => `<option value="${esc(c.name)}"${c.name===cur?' selected':''}>${esc(c.name)}</option>`).join('');
-
-  const stageSel = document.getElementById('f-stage');
-  const curStage = stageSel.value;
-  stageSel.innerHTML = '<option value="">All stages</option>' +
-    (d.stages || []).map(s => `<option value="${esc(s.name)}"${s.name===curStage?' selected':''}>${esc(s.name)} (${s.count})</option>`).join('');
 }
 
 // ── Leads table ────────────────────────────────────────────────────────────
@@ -898,10 +899,10 @@ function trunc(s, n) { return s && s.length > n ? s.slice(0,n) + '…' : (s || '
 
 // ── Boot ───────────────────────────────────────────────────────────────────
 (async () => {
-  await refreshStats();
-  await refreshJobs();
+  try { await refreshStats(); } catch(e) { console.error('refreshStats failed:', e); }
+  try { await refreshJobs();  } catch(e) { console.error('refreshJobs failed:', e); }
   await loadLeads(1);
-  ensurePolling();   // keeps stats fresh even before first job
+  ensurePolling();
 })();
 </script>
 </body>
