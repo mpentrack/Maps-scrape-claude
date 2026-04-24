@@ -7,6 +7,7 @@ import csv
 import io
 import logging
 import os
+import queue
 import re
 import sqlite3
 import threading
@@ -72,7 +73,9 @@ DETAIL_ENDPOINTS = (
 # ── In-memory job store ───────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
-MAX_JOB_EVENTS = 200
+MAX_JOB_EVENTS  = 200
+MAX_STORED_JOBS = 30
+_job_queue: queue.Queue = queue.Queue()   # (job_id, api_key) tuples
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -613,6 +616,38 @@ def _job_event(job_id: str, level: str, stage: str, message: str) -> None:
             del events[: len(events) - MAX_JOB_EVENTS]
 
 
+def _prune_old_jobs() -> None:
+    """Remove oldest terminal jobs from _jobs, keeping at most MAX_STORED_JOBS."""
+    TERMINAL = {"completed", "failed", "cancelled"}
+    with _jobs_lock:
+        terminal = [j for j in _jobs.values() if j["status"] in TERMINAL]
+        if len(terminal) <= MAX_STORED_JOBS:
+            return
+        terminal.sort(key=lambda j: j.get("started_at") or "")
+        for j in terminal[: len(terminal) - MAX_STORED_JOBS]:
+            del _jobs[j["id"]]
+
+
+def _queue_worker() -> None:
+    """Single consumer thread: runs one job at a time from _job_queue."""
+    while True:
+        job_id, api_key = _job_queue.get()
+        try:
+            with _jobs_lock:
+                job = _jobs.get(job_id)
+            if job is None:
+                continue
+            if job.get("status") == "cancelled":
+                _job_event(job_id, "info", "job", "Job was cancelled before it started.")
+                continue
+            _run_job(job_id, api_key)
+        except Exception:
+            log.exception("Unexpected error in _queue_worker for job %s", job_id)
+        finally:
+            _job_queue.task_done()
+            _prune_old_jobs()
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -628,6 +663,20 @@ def list_jobs():
             for j in _jobs.values()
         ]
     return jsonify(sorted(jobs, key=lambda x: x["started_at"], reverse=True))
+
+
+@app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
+def cancel_job(job_id: str):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job["status"] != "queued":
+            return jsonify({"error": f"Cannot cancel a job with status '{job['status']}'"}), 409
+        job["status"] = "cancelled"
+        job["completed_at"] = datetime.utcnow().isoformat()
+    _job_event(job_id, "info", "job", "Job cancelled by user.")
+    return jsonify({"ok": True})
 
 
 @app.route("/api/jobs/<job_id>/events", methods=["GET"])
@@ -679,13 +728,14 @@ def start_job():
         "keyword":             keyword,
         "state":               state,
         "zip_codes":           zips,
-        "status":              "pending",
+        "status":              "queued",
         "total":               len(zips),
         "processed":           0,
         "inserted":            0,
         "duplicates":          0,
         "geo_rejected":        0,
         "no_website_prospect": 0,
+        "queued_at":           datetime.utcnow().isoformat(),
         "started_at":          datetime.utcnow().isoformat(),
         "completed_at":        None,
         "error":               None,
@@ -697,9 +747,9 @@ def start_job():
 
     with _jobs_lock:
         _jobs[job["id"]] = job
-    _job_event(job["id"], "info", "job", f"Job created ({run_mode}). Keyword='{keyword}'. Target zips={len(zips)}.")
+    _job_event(job["id"], "info", "job", f"Job queued ({run_mode}). Keyword='{keyword}'. Target zips={len(zips)}.")
 
-    threading.Thread(target=_run_job, args=(job["id"], api_key), daemon=True).start()
+    _job_queue.put((job["id"], api_key))
     return jsonify({"id": job["id"]}), 202
 
 
@@ -927,6 +977,7 @@ def download_file(filename: str):
 
 if __name__ == "__main__":
     init_db()
+    threading.Thread(target=_queue_worker, daemon=True, name="job-queue-worker").start()
     app.run(
         host="0.0.0.0",
         port=int(os.environ.get("PORT", 5000)),

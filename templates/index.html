@@ -224,10 +224,12 @@
     }
 
     /* ── Status badges ── */
-    .badge-running   { background: rgba(88,166,255,.15); color: var(--accent); }
-    .badge-completed { background: rgba(63,185,80,.15);  color: var(--green);  }
-    .badge-failed    { background: rgba(248,81,73,.15);  color: var(--red);    }
-    .badge-pending   { background: rgba(240,136,62,.15); color: var(--orange); }
+    .badge-running   { background: rgba(88,166,255,.15);  color: var(--accent); }
+    .badge-completed { background: rgba(63,185,80,.15);   color: var(--green);  }
+    .badge-failed    { background: rgba(248,81,73,.15);   color: var(--red);    }
+    .badge-pending   { background: rgba(240,136,62,.15);  color: var(--orange); }
+    .badge-queued    { background: rgba(240,136,62,.12);  color: #d29922;       }
+    .badge-cancelled { background: rgba(139,148,158,.12); color: var(--muted);  }
     .status-badge {
       font-size: 0.68rem;
       font-weight: 700;
@@ -644,11 +646,20 @@ async function refreshJobs() {
 
   el.innerHTML = jobs.map(j => {
     const pct   = j.total ? Math.round((j.processed / j.total) * 100) : 0;
-    const color = {running:'var(--accent)', completed:'var(--green)', failed:'var(--red)', pending:'var(--orange)'}[j.status] || 'var(--muted)';
+    const color = {
+      running:'var(--accent)', completed:'var(--green)', failed:'var(--red)',
+      queued:'#d29922', cancelled:'var(--muted)', pending:'var(--orange)',
+    }[j.status] || 'var(--muted)';
     const events = Array.isArray(j.events) ? j.events : [];
     const isExpanded = expandedJobLogs.has(j.id);
     const visible = isExpanded ? events : events.slice(-4);
     const hasMore = events.length > 4;
+    let queuePos = null;
+    if (j.status === 'queued') {
+      const q = jobs.filter(x => x.status === 'queued')
+                    .sort((a, b) => (a.started_at || '').localeCompare(b.started_at || ''));
+      queuePos = q.findIndex(x => x.id === j.id) + 1;
+    }
     return `
       <div class="job-card">
         <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
@@ -657,7 +668,15 @@ async function refreshJobs() {
             ${j.state ? `<span class="chip ms-1">${esc(j.state)}</span>` : ''}
             ${j.run_mode ? `<span class="chip ms-1">${esc(j.run_mode)}</span>` : ''}
           </div>
-          <span class="status-badge badge-${j.status}">${j.status}</span>
+          <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+            ${j.status === 'queued' ? `<button onclick="cancelJob('${esc(j.id)}')"
+              title="Cancel queued job"
+              style="background:transparent;border:1px solid var(--muted);color:var(--muted);
+                     border-radius:4px;padding:1px 6px;font-size:0.7rem;cursor:pointer;line-height:1.4"
+              onmouseover="this.style.borderColor='var(--red)';this.style.color='var(--red)'"
+              onmouseout="this.style.borderColor='var(--muted)';this.style.color='var(--muted)'">&#x2715;</button>` : ''}
+            <span class="status-badge badge-${j.status}">${j.status}</span>
+          </div>
         </div>
         <div class="prog-track">
           <div class="prog-fill" style="width:${pct}%;background:${color}"></div>
@@ -671,6 +690,7 @@ async function refreshJobs() {
           ${j.cleaned ? `<span>clean ${j.cleaned.clean || 0}/${j.cleaned.checked || 0}</span>` : ''}
           <span style="margin-left:auto">${pct}%</span>
         </div>
+        ${queuePos ? `<div style="font-size:0.72rem;color:#d29922;margin-top:2px">Waiting: #${queuePos} in queue</div>` : ''}
         ${j.error ? `<div style="color:var(--red);font-size:0.72rem;margin-top:4px">${esc(j.error)}</div>` : ''}
         <div class="event-log">
           ${visible.length ? visible.map(e => `
@@ -685,8 +705,8 @@ async function refreshJobs() {
       </div>`;
   }).join('');
 
-  // Stop polling if all jobs settled, then reload leads
-  const hasActive = jobs.some(j => j.status === 'running' || j.status === 'pending');
+  // Stop polling when no jobs are running or waiting in queue
+  const hasActive = jobs.some(j => j.status === 'running' || j.status === 'queued');
   if (!hasActive) {
     clearInterval(pollTimer);
     pollTimer = null;
@@ -701,6 +721,14 @@ function toggleJobEvents(jobId) {
     expandedJobLogs.add(jobId);
   }
   refreshJobs();
+}
+
+async function cancelJob(jobId) {
+  try {
+    const res = await fetch(`/api/jobs/${jobId}/cancel`, { method: 'POST' });
+    if (res.ok) await refreshJobs();
+    else console.warn('Cancel failed:', (await res.json()).error);
+  } catch(e) { console.error('cancelJob error:', e); }
 }
 
 // ── Stats ──────────────────────────────────────────────────────────────────
