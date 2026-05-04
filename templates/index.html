@@ -424,6 +424,29 @@
           <div id="bulk-msg" class="mt-2" style="font-size:0.78rem;color:var(--muted)"></div>
         </div>
       </div>
+
+      <div class="card mt-3">
+        <div class="card-hd"><span>Re-enrich Without Email</span></div>
+        <div class="card-body">
+          <p style="font-size:0.78rem;color:var(--muted);margin-bottom:10px">
+            Re-run all enrichment steps on records that have a website but no email.
+            Archived records that get an email are automatically un-archived.
+          </p>
+          <div class="mb-2">
+            <label class="lbl">Limit (optional)</label>
+            <input type="number" class="form-control" id="re-enrich-limit" min="1" placeholder="e.g. 200">
+          </div>
+          <div class="d-grid gap-2">
+            <button class="btn-ghost" onclick="reEnrich('archived')" id="btn-re-enrich-archived">
+              Re-enrich Archived (no email)
+            </button>
+            <button class="btn-ghost" onclick="reEnrich('enrich_failed')" id="btn-re-enrich-failed">
+              Retry Failed Enrichment
+            </button>
+          </div>
+          <div id="re-enrich-msg" class="mt-2" style="font-size:0.78rem;color:var(--muted)"></div>
+        </div>
+      </div>
     </div>
 
     <!-- ── RIGHT COLUMN: Stats + Leads ── -->
@@ -865,6 +888,46 @@ async function advanceStage(action) {
   msg.textContent = `${action} finished: ${JSON.stringify(data.result)}`;
   await refreshStats();
   await loadLeads(currentPage);
+}
+
+// ── Re-enrich archived / failed records ───────────────────────────────────
+async function reEnrich(fromStage) {
+  const limitRaw = document.getElementById('re-enrich-limit').value.trim();
+  const msg = document.getElementById('re-enrich-msg');
+  const btnId = fromStage === 'archived' ? 'btn-re-enrich-archived' : 'btn-re-enrich-failed';
+  const btn = document.getElementById(btnId);
+
+  msg.style.color = 'var(--muted)';
+  msg.textContent = `Running re-enrichment on ${fromStage} records… (this may take a while)`;
+  btn.disabled = true;
+
+  const payload = {from_stage: fromStage};
+  if (limitRaw) payload.limit = Number(limitRaw);
+
+  try {
+    const res = await fetch('/api/pipeline/re-enrich', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msg.style.color = 'var(--red)';
+      msg.textContent = data.error || 'Re-enrich failed';
+      return;
+    }
+    const r = data.result || {};
+    const unarchived = fromStage === 'archived' ? ` (${r.enriched || 0} un-archived)` : '';
+    msg.style.color = 'var(--green)';
+    msg.textContent = `Done: checked ${r.checked || 0}, found email for ${r.enriched || 0}${unarchived}, still missing ${r.no_email || 0}.`;
+    await refreshStats();
+    await loadLeads(currentPage);
+  } catch(e) {
+    msg.style.color = 'var(--red)';
+    msg.textContent = 'Re-enrich failed: ' + e;
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 // ── Archive ────────────────────────────────────────────────────────────────

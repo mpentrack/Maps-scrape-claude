@@ -502,10 +502,22 @@ def _run_job(job_id: str, api_key: str) -> None:
         conn.close()
 
 
-def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | None) -> dict:
+def _enrich_stage_rows(
+    conn: sqlite3.Connection,
+    from_stage: str,
+    limit: int | None,
+    *,
+    keep_stage_on_failure: bool = False,
+) -> dict:
+    """Enrich records in from_stage that have a website but no email.
+
+    When keep_stage_on_failure=True (used for re-enriching archived records),
+    failed records retain their original pipeline_stage instead of moving to
+    'enrich_failed'. Successful records always move to 'enriched'.
+    """
     where = "WHERE pipeline_stage = ? AND website_url IS NOT NULL AND (email IS NULL OR email = '')"
-    params = [from_stage]
-    query = "SELECT id, website_url FROM businesses " + where + " ORDER BY id ASC"
+    params: list = [from_stage]
+    query = "SELECT id, website_url, business_name, city FROM businesses " + where + " ORDER BY id ASC"
     if limit:
         query += " LIMIT ?"
         params.append(limit)
@@ -518,8 +530,10 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
     no_email = 0
 
     def task(row):
-        row_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
-        website_url = row["website_url"] if isinstance(row, sqlite3.Row) else row[1]
+        row_id = row["id"]
+        website_url = row["website_url"]
+        biz_name = row["business_name"]
+        biz_city = row["city"]
         session = requests.Session()
         session.headers.update({"User-Agent": ENRICH_USER_AGENT})
         try:
@@ -527,6 +541,8 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
                 website_url,
                 session,
                 allow_generic_fallback=EMAIL_ALLOW_GENERIC_FALLBACK,
+                business_name=biz_name,
+                city=biz_city,
             )
             return row_id, res
         finally:
@@ -546,10 +562,17 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
                     enriched += 1
             else:
                 reason = res.stage_reason or "no_email_found"
-                conn.execute(
-                    "UPDATE businesses SET pipeline_stage='enrich_failed', stage_reason=?, enriched_at=? WHERE id=?",
-                    (reason, now, row_id),
-                )
+                if keep_stage_on_failure:
+                    # Leave pipeline_stage unchanged (record stays in its original stage)
+                    conn.execute(
+                        "UPDATE businesses SET stage_reason=?, enriched_at=? WHERE id=?",
+                        (reason, now, row_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE businesses SET pipeline_stage='enrich_failed', stage_reason=?, enriched_at=? WHERE id=?",
+                        (reason, now, row_id),
+                    )
                 with result_lock:
                     no_email += 1
             if res.city:
@@ -943,6 +966,38 @@ def advance_pipeline():
         else:
             result = _clean_stage_rows(conn, from_stage, limit)
         return jsonify({"ok": True, "action": action, "from_stage": from_stage, "result": result})
+    finally:
+        conn.close()
+
+
+@app.route("/api/pipeline/re-enrich", methods=["POST"])
+def re_enrich_archived():
+    """Re-run enrichment on archived or enrich_failed records that have no email.
+
+    On success the record moves to 'enriched' (un-archiving it so it appears
+    in default views). On failure, archived records stay 'archived';
+    enrich_failed records move to 'enrich_failed' (no change from current).
+    """
+    data = request.get_json(force=True) or {}
+    from_stage = (data.get("from_stage") or "archived").strip()
+    limit = data.get("limit")
+
+    if from_stage not in {"archived", "enrich_failed"}:
+        return jsonify({"error": "from_stage must be 'archived' or 'enrich_failed'"}), 400
+
+    try:
+        if limit is not None:
+            limit = int(limit)
+            if limit <= 0:
+                limit = None
+    except (TypeError, ValueError):
+        return jsonify({"error": "limit must be a number"}), 400
+
+    conn = get_conn()
+    try:
+        keep_on_fail = (from_stage == "archived")
+        result = _enrich_stage_rows(conn, from_stage, limit, keep_stage_on_failure=keep_on_fail)
+        return jsonify({"ok": True, "from_stage": from_stage, "result": result})
     finally:
         conn.close()
 
