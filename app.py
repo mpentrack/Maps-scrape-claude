@@ -23,7 +23,7 @@ import requests
 from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import formatted_address_from_item, resolve_city
-from email_extract import USER_AGENT as ENRICH_USER_AGENT, scrape_email_for_website
+from email_extract import USER_AGENT as ENRICH_USER_AGENT, env_int, scrape_email_for_website
 from maps_item import contact_fields_from_maps_item, iter_search_results
 from zip_geocode import us_zip_latlng
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
@@ -48,8 +48,8 @@ PAGE_SIZE   = 20
 MAX_PAGES   = 10
 MAX_RETRIES = 6
 JOB_WORKERS = 5   # concurrent zips per job
-ENRICH_WORKERS = int(os.environ.get("ENRICH_WORKERS", "20"))
-MX_WORKERS = int(os.environ.get("MX_WORKERS", "20"))
+ENRICH_WORKERS = env_int("ENRICH_WORKERS", 20)
+MX_WORKERS = env_int("MX_WORKERS", 20)
 APPEND_ZIP_TO_QUERY = os.environ.get("APPEND_ZIP_TO_QUERY", "1").strip().lower() not in ("0", "false", "no", "off")
 # When false (default), do not store info@ / hello@ / etc. if that is all the site exposes.
 EMAIL_ALLOW_GENERIC_FALLBACK = os.environ.get("EMAIL_ALLOW_GENERIC_FALLBACK", "0").strip().lower() in (
@@ -1151,6 +1151,6 @@ if __name__ == "__main__":
     threading.Thread(target=_queue_worker, daemon=True, name="job-queue-worker").start()
     app.run(
         host="0.0.0.0",
-        port=int(os.environ.get("PORT", 5000)),
+        port=env_int("PORT", 5000),
         debug=False,
     )
