@@ -15,6 +15,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from functools import lru_cache
 from zoneinfo import ZoneInfo
 from pathlib import Path
 
@@ -48,6 +49,7 @@ MAX_PAGES   = 10
 MAX_RETRIES = 6
 JOB_WORKERS = 5   # concurrent zips per job
 ENRICH_WORKERS = int(os.environ.get("ENRICH_WORKERS", "20"))
+MX_WORKERS = int(os.environ.get("MX_WORKERS", "20"))
 APPEND_ZIP_TO_QUERY = os.environ.get("APPEND_ZIP_TO_QUERY", "1").strip().lower() not in ("0", "false", "no", "off")
 # When false (default), do not store info@ / hello@ / etc. if that is all the site exposes.
 EMAIL_ALLOW_GENERIC_FALLBACK = os.environ.get("EMAIL_ALLOW_GENERIC_FALLBACK", "0").strip().lower() in (
@@ -69,6 +71,26 @@ DETAIL_ENDPOINTS = (
     "/placedetails.php",
     "/place_details.php",
 )
+DETAIL_PARAM_KEYS = ("place_id", "google_id", "cid")
+
+# Campaign vertical inferred from the search keyword when the caller omits one.
+VERTICAL_MAP = {
+    "impact windows": "windows", "hurricane shutters": "windows",
+    "window replacement": "windows", "impact doors": "windows",
+    "plumber": "plumbing", "emergency plumber": "plumbing",
+    "hvac contractor": "hvac", "air conditioning repair": "hvac",
+    "heating contractor": "hvac", "ac repair": "hvac",
+    "window blinds": "blinds", "window treatments": "blinds",
+    "plantation shutters": "blinds",
+    "kitchen remodeling": "remodeling", "bathroom remodeling": "remodeling",
+    "home remodeling contractor": "remodeling",
+}
+
+
+def vertical_for_keyword(keyword: str) -> str:
+    """Map a search keyword onto a campaign vertical; unmapped keywords pass through."""
+    k = (keyword or "").strip()
+    return VERTICAL_MAP.get(k.lower(), k)
 
 # ── In-memory job store ───────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
@@ -76,6 +98,12 @@ _jobs_lock = threading.Lock()
 MAX_JOB_EVENTS  = 200
 MAX_STORED_JOBS = 30
 _job_queue: queue.Queue = queue.Queue()   # (job_id, api_key) tuples
+
+# ── Place-details probing state (shared across jobs and zips) ─────────────────
+_details_cache: dict[str, dict | None] = {}
+_details_lock = threading.Lock()
+_DETAIL_COMBO: tuple[str, str] | None = None   # (endpoint, param key) once one works
+MAX_DETAILS_CACHE = 5000
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -126,6 +154,18 @@ def init_db() -> None:
         "enriched_at": "ALTER TABLE businesses ADD COLUMN enriched_at TEXT",
         "cleaned_at": "ALTER TABLE businesses ADD COLUMN cleaned_at TEXT",
         "created_at": "ALTER TABLE businesses ADD COLUMN created_at TEXT",
+        # Which campaign produced the row — `category` holds Maps' types[0], which
+        # does not map onto verticals.
+        "search_keyword": "ALTER TABLE businesses ADD COLUMN search_keyword TEXT",
+        "vertical": "ALTER TABLE businesses ADD COLUMN vertical TEXT",
+        # Ad-tech fingerprints captured during the enrichment crawl.
+        "runs_google_ads": "ALTER TABLE businesses ADD COLUMN runs_google_ads INTEGER",
+        "aw_ids": "ALTER TABLE businesses ADD COLUMN aw_ids TEXT",
+        "call_tracking": "ALTER TABLE businesses ADD COLUMN call_tracking TEXT",
+        "has_gtm": "ALTER TABLE businesses ADD COLUMN has_gtm INTEGER",
+        "has_ga4": "ALTER TABLE businesses ADD COLUMN has_ga4 INTEGER",
+        # Every candidate address, not just the one chosen by pick_best_email().
+        "all_emails": "ALTER TABLE businesses ADD COLUMN all_emails TEXT",
     }.items():
         if col not in cols:
             conn.execute(ddl)
@@ -242,31 +282,53 @@ def _first_dict_payload(data: dict | None) -> dict | None:
     return data
 
 
-def _fetch_place_details(place_token: str, api_key: str, cache: dict[str, dict | None]) -> dict | None:
-    if place_token in cache:
-        return cache[place_token]
-    for ep in DETAIL_ENDPOINTS:
-        for params in (
-            {"place_id": place_token, "language": "en"},
-            {"google_id": place_token, "language": "en"},
-            {"cid": place_token, "language": "en"},
-        ):
-            data = _api_get(f"{API_BASE}{ep}", params, api_key, log_context="place-detail")
-            payload = _first_dict_payload(data)
-            if isinstance(payload, dict) and payload:
-                cache[place_token] = payload
-                return payload
-    cache[place_token] = None
-    return None
+def _fetch_place_details(place_token: str, api_key: str) -> dict | None:
+    """Look up a place, probing endpoints only until one combination works.
+
+    The first successful (endpoint, param-key) pair is pinned for the rest of the
+    process, so later lookups cost one API call instead of up to twelve. The cache
+    is module-scoped: overlapping ZIPs share it instead of re-probing per ZIP.
+    """
+    global _DETAIL_COMBO
+    with _details_lock:
+        if place_token in _details_cache:
+            return _details_cache[place_token]
+        combo = _DETAIL_COMBO
+
+    combos = [combo] if combo else [
+        (ep, key) for ep in DETAIL_ENDPOINTS for key in DETAIL_PARAM_KEYS
+    ]
+    payload = None
+    for ep, key in combos:
+        data = _api_get(
+            f"{API_BASE}{ep}", {key: place_token, "language": "en"}, api_key,
+            log_context="place-detail",
+        )
+        found = _first_dict_payload(data)
+        if isinstance(found, dict) and found:
+            payload = found
+            if combo is None:
+                with _details_lock:
+                    if _DETAIL_COMBO is None:
+                        _DETAIL_COMBO = (ep, key)
+                        log.info("Pinned place-details endpoint %s with param %r", ep, key)
+            break
+
+    with _details_lock:
+        if len(_details_cache) >= MAX_DETAILS_CACHE:
+            for stale in list(_details_cache)[: MAX_DETAILS_CACHE // 2]:
+                del _details_cache[stale]
+        _details_cache[place_token] = payload
+    return payload
 
 
-def _hydrate_row_location(row: dict, item: dict, zip_code: str, api_key: str, cache: dict[str, dict | None]) -> dict:
+def _hydrate_row_location(row: dict, item: dict, zip_code: str, api_key: str) -> dict:
     if row.get("address") and row.get("city"):
         return item
     token = _extract_place_token(item)
     if not token:
         return item
-    details = _fetch_place_details(token, api_key, cache)
+    details = _fetch_place_details(token, api_key)
     if not details:
         return item
     if not row.get("address"):
@@ -282,6 +344,8 @@ def _insert(
     row: dict,
     pipeline_stage: str = "scraped",
     stage_reason: str | None = None,
+    search_keyword: str | None = None,
+    vertical: str | None = None,
 ) -> bool:
     phone = row.get("phone") or None
     url   = row.get("website_url") or None
@@ -291,11 +355,12 @@ def _insert(
         try:
             conn.execute(
                 "INSERT INTO businesses "
-                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, "
+                "search_keyword, vertical, pipeline_stage, stage_reason, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row["business_name"], row["address"], row.get("city"), phone, url,
                  row["rating"], row["review_count"], row["category"], row["zip_code"], row.get("search_zip"),
-                 pipeline_stage, stage_reason, _now_eastern()),
+                 search_keyword, vertical, pipeline_stage, stage_reason, _now_eastern()),
             )
             conn.commit()
             return True
@@ -310,9 +375,10 @@ def _scrape_zip(
     conn: sqlite3.Connection,
     lock: threading.Lock,
     job_id: str | None = None,
+    vertical: str | None = None,
 ) -> tuple[int, int, int, int]:
     inserted = skipped = geo_rejected = no_website = 0
-    details_cache: dict[str, dict | None] = {}
+    vertical = vertical or vertical_for_keyword(keyword)
     query = _query_for_zip(keyword, zip_code)
     coords = us_zip_latlng(zip_code)
     if not coords:
@@ -367,7 +433,7 @@ def _scrape_zip(
             break
         for item in results:
             row = _parse(item, zip_code)
-            item_for_match = _hydrate_row_location(row, item, zip_code, api_key, details_cache)
+            item_for_match = _hydrate_row_location(row, item, zip_code, api_key)
             row["zip_code"] = best_listing_zip(item_for_match, row.get("address"))
             expected_zip = normalize_zip5(zip_code)
             strict_exact = os.environ.get("STRICT_EXACT_ZIP", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -375,17 +441,17 @@ def _scrape_zip(
             geo_ok = listing_matches_search_zip(item_for_match, row.get("address"), zip_code)
             accept = exact_ok if strict_exact else geo_ok
             if not accept:
-                if _insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch"):
+                if _insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch", keyword, vertical):
                     geo_rejected += 1
                 else:
                     skipped += 1
                 continue
             if not row.get("website_url"):
-                if _insert(conn, lock, row, "no_website_prospect", "no_website"):
+                if _insert(conn, lock, row, "no_website_prospect", "no_website", keyword, vertical):
                     no_website += 1
                 else:
                     skipped += 1
-            elif _insert(conn, lock, row):
+            elif _insert(conn, lock, row, "scraped", None, keyword, vertical):
                 inserted += 1
             else:
                 skipped += 1
@@ -423,9 +489,10 @@ def _run_job(job_id: str, api_key: str) -> None:
     with _jobs_lock:
         j = _jobs[job_id]
     log.info(
-        "[scrape-job %s] started keyword=%r zip_count=%d mode=%s",
+        "[scrape-job %s] started keyword=%r vertical=%r zip_count=%d mode=%s",
         job_id,
         j.get("keyword"),
+        j.get("vertical"),
         len(j.get("zip_codes") or []),
         j.get("run_mode", "scrape_only"),
     )
@@ -438,7 +505,10 @@ def _run_job(job_id: str, api_key: str) -> None:
     try:
         with ThreadPoolExecutor(max_workers=JOB_WORKERS) as pool:
             futures = {
-                pool.submit(_scrape_zip, z, job["keyword"], api_key, conn, lock, job_id): z
+                pool.submit(
+                    _scrape_zip, z, job["keyword"], api_key, conn, lock, job_id,
+                    job.get("vertical"),
+                ): z
                 for z in job["zip_codes"]
             }
             for future in as_completed(futures):
@@ -502,6 +572,18 @@ def _run_job(job_id: str, api_key: str) -> None:
         conn.close()
 
 
+def _signal_columns(signals: dict | None) -> tuple:
+    """Flatten detect_signals() output into the UPDATE parameter order."""
+    s = signals or {}
+    return (
+        1 if s.get("runs_google_ads") else 0,
+        s.get("aw_ids") or None,
+        s.get("call_tracking"),
+        1 if s.get("has_gtm") else 0,
+        1 if s.get("has_ga4") else 0,
+    )
+
+
 def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | None) -> dict:
     where = "WHERE pipeline_stage = ? AND website_url IS NOT NULL AND (email IS NULL OR email = '')"
     params = [from_stage]
@@ -537,18 +619,23 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
         for fut in as_completed(futures):
             row_id, res = fut.result()
             now = datetime.utcnow().isoformat()
+            sig = _signal_columns(res.signals)
             if res.email:
                 conn.execute(
-                    "UPDATE businesses SET email=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=? WHERE id=?",
-                    (res.email, now, row_id),
+                    "UPDATE businesses SET email=?, all_emails=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=?, "
+                    "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
+                    (res.email, res.all_emails, now, *sig, row_id),
                 )
                 with result_lock:
                     enriched += 1
             else:
                 reason = res.stage_reason or "no_email_found"
+                # Signals are written here too: a business running ads with no
+                # discoverable email is still worth knowing about.
                 conn.execute(
-                    "UPDATE businesses SET pipeline_stage='enrich_failed', stage_reason=?, enriched_at=? WHERE id=?",
-                    (reason, now, row_id),
+                    "UPDATE businesses SET all_emails=?, pipeline_stage='enrich_failed', stage_reason=?, enriched_at=?, "
+                    "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
+                    (res.all_emails, reason, now, *sig, row_id),
                 )
                 with result_lock:
                     no_email += 1
@@ -561,11 +648,68 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
     return {"checked": len(rows), "enriched": enriched, "no_email": no_email}
 
 
+@lru_cache(maxsize=20000)
+def has_mx(domain: str, timeout: float = 3.0) -> bool:
+    """True if the domain can plausibly receive mail.
+
+    Only definitive negatives (no MX *and* no A/AAAA record, or NXDOMAIN) return
+    False — timeouts and resolver errors return True so a flaky lookup never
+    discards a good lead. MillionVerifier remains the final gate; this only stops
+    us paying to verify dead domains.
+    """
+    domain = (domain or "").strip().lower()
+    if not domain or "." not in domain:
+        return False
+    try:
+        import dns.resolver  # optional: dnspython
+    except ImportError:
+        return True
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+    try:
+        answers = resolver.resolve(domain, "MX")
+        if len(answers) > 0:
+            return True
+    except (dns.resolver.NoAnswer, dns.resolver.NoNameservers):
+        pass                        # no MX — fall through to the implicit-MX check
+    except dns.resolver.NXDOMAIN:
+        return False
+    except Exception:
+        return True                 # timeout / transient resolver failure
+    # RFC 5321 implicit MX: a domain with an address record still accepts mail.
+    for rtype in ("A", "AAAA"):
+        try:
+            if len(resolver.resolve(domain, rtype)) > 0:
+                return True
+        except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN, dns.resolver.NoNameservers):
+            continue
+        except Exception:
+            return True
+    return False
+
+
+def _warm_mx_cache(rows) -> None:
+    """Resolve every distinct email domain up front, 20 at a time."""
+    domains = {
+        (row["email"] or "").strip().lower().split("@")[-1]
+        for row in rows
+        if (row["email"] or "").strip() and "@" in (row["email"] or "")
+    }
+    domains.discard("")
+    if not domains:
+        return
+    with ThreadPoolExecutor(max_workers=MX_WORKERS) as pool:
+        list(pool.map(has_mx, sorted(domains)))
+
+
 def _classify_clean_stage(row: sqlite3.Row) -> tuple[str, str | None]:
     email = (row["email"] or "").strip().lower()
     name = (row["business_name"] or "").lower()
     if not email:
         return "clean_failed", "missing_email"
+    if "@" not in email or not has_mx(email.split("@")[-1]):
+        return "clean_failed", "no_mx"
     if FLAG_FREE_EMAIL_DOMAINS and email.split("@")[-1] in PERSONAL_DOMAINS:
         return "flagged", "personal_email_domain"
     if "permanently closed" in name:
@@ -580,6 +724,7 @@ def _clean_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | No
         query += " LIMIT ?"
         params.append(limit)
     rows = conn.execute(query, params).fetchall()
+    _warm_mx_cache(rows)
     clean = 0
     flagged = 0
     failed = 0
@@ -704,6 +849,7 @@ def start_job():
     state       = (data.get("state")       or "").strip().upper()
     custom_zips = (data.get("custom_zips") or "").strip()
     run_mode    = (data.get("run_mode") or "scrape_only").strip()
+    vertical    = (data.get("vertical")    or "").strip()
 
     if not keyword:
         return jsonify({"error": "Keyword is required"}), 400
@@ -723,9 +869,11 @@ def start_job():
     zips = list(dict.fromkeys(zips))  # deduplicate
     if run_mode not in {"scrape_only", "full_pipeline"}:
         return jsonify({"error": "Invalid run mode"}), 400
+    vertical = vertical or vertical_for_keyword(keyword)
     job = {
         "id":                  str(uuid.uuid4())[:8],
         "keyword":             keyword,
+        "vertical":            vertical,
         "state":               state,
         "zip_codes":           zips,
         "status":              "queued",
@@ -747,7 +895,10 @@ def start_job():
 
     with _jobs_lock:
         _jobs[job["id"]] = job
-    _job_event(job["id"], "info", "job", f"Job queued ({run_mode}). Keyword='{keyword}'. Target zips={len(zips)}.")
+    _job_event(
+        job["id"], "info", "job",
+        f"Job queued ({run_mode}). Keyword='{keyword}'. Vertical='{vertical}'. Target zips={len(zips)}.",
+    )
 
     _job_queue.put((job["id"], api_key))
     return jsonify({"id": job["id"]}), 202
@@ -870,26 +1021,43 @@ def export():
     has_email   = request.args.get("has_email",   "false").lower() == "true"
     category    = request.args.get("category",    "")
     stage       = request.args.get("stage",       "")
+    vertical    = request.args.get("vertical",    "")
 
-    where, params = _build_where(min_rating, min_reviews, has_email, category, stage)
+    where, params = _build_where(min_rating, min_reviews, has_email, category, stage, vertical)
     if not stage:
         extra = "pipeline_stage != 'archived'"
         where = f"WHERE {extra}" if not where else f"{where} AND {extra}"
 
+    # Keep this list and the CSV header below in lock-step.
+    columns = [
+        "business_name", "address", "city", "phone", "website_url", "email", "all_emails",
+        "rating", "review_count", "category", "zip_code", "search_zip",
+        "search_keyword", "vertical",
+        "runs_google_ads", "aw_ids", "call_tracking", "has_gtm", "has_ga4",
+        "pipeline_stage", "stage_reason", "created_at",
+    ]
+    select_cols = ", ".join(columns)
+    if has_email:
+        # One row per distinct address — the same business is reached through
+        # overlapping ZIPs and through http/https/www URL variants.
+        sql = (
+            f"SELECT {select_cols} FROM businesses WHERE id IN "
+            f"(SELECT MIN(id) FROM businesses {where} GROUP BY LOWER(TRIM(email))) "
+            f"ORDER BY id DESC"
+        )
+    else:
+        sql = f"SELECT {select_cols} FROM businesses {where} ORDER BY id DESC"
+
     conn = get_conn()
-    rows = conn.execute(
-        f"SELECT business_name, address, city, phone, website_url, email, "
-        f"rating, review_count, category, zip_code, search_zip, pipeline_stage, stage_reason, created_at "
-        f"FROM businesses {where} ORDER BY id DESC",
-        params,
-    ).fetchall()
+    rows = conn.execute(sql, params).fetchall()
     conn.close()
+
+    header = columns[:-1] + ["scraped_at_et"]
 
     def generate():
         buf = io.StringIO()
         w   = csv.writer(buf)
-        w.writerow(["business_name","address","city","phone","website_url","email",
-                    "rating","review_count","category","zip_code","search_zip","pipeline_stage","stage_reason","scraped_at_et"])
+        w.writerow(header)
         for row in rows:
             w.writerow(list(row))
         yield buf.getvalue()
@@ -902,7 +1070,8 @@ def export():
     )
 
 
-def _build_where(min_rating: float, min_reviews: int, has_email: bool, category: str, stage: str):
+def _build_where(min_rating: float, min_reviews: int, has_email: bool, category: str, stage: str,
+                 vertical: str = ""):
     clauses, params = [], []
     if min_rating > 0:
         clauses.append("rating >= ?");     params.append(min_rating)
@@ -914,6 +1083,8 @@ def _build_where(min_rating: float, min_reviews: int, has_email: bool, category:
         clauses.append("category = ?");    params.append(category)
     if stage:
         clauses.append("pipeline_stage = ?"); params.append(stage)
+    if vertical:
+        clauses.append("LOWER(vertical) = ?"); params.append(vertical.strip().lower())
     where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     return where, params
 

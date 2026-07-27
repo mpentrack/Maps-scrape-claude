@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -24,14 +25,23 @@ EMAIL_RE = re.compile(
 
 # Patterns used to expand human-readable email obfuscations before regex matching.
 # e.g. "john [at] hvacpros [dot] com" → "john@hvacpros.com"
-_OBFUSCATED_AT = re.compile(r"\s*[\[\(]at[\]\)]\s*|\s+at\s+(?=[a-zA-Z0-9])", re.IGNORECASE)
-_OBFUSCATED_DOT = re.compile(r"\s*[\[\(]dot[\]\)]\s*", re.IGNORECASE)
+#
+# The bracketed forms are unambiguous. A bare " at " is not: prose like
+# "Serving customers at Newington.We cover Hartford" would otherwise become
+# "customers@Newington.We". _OBF_AT_BARE therefore only fires when what follows
+# genuinely looks like a domain — a labelled name plus a real dotted TLD.
+_OBF_AT = re.compile(r"\s*[\[\(\{]\s*at\s*[\]\)\}]\s*", re.I)
+_OBF_DOT = re.compile(r"\s*[\[\(\{]\s*dot\s*[\]\)\}]\s*", re.I)
+_OBF_AT_BARE = re.compile(
+    r"(?<=[\w.\-])\s+at\s+(?=[\w\-]+(?:\s+dot\s+|\.)[\w\-]+\.[a-z]{2,})", re.I
+)
 
 
 def _normalize_obfuscated(text: str) -> str:
-    """Expand [at]/(at)/[dot]/(dot) obfuscations so EMAIL_RE can match them."""
-    t = _OBFUSCATED_AT.sub("@", text)
-    t = _OBFUSCATED_DOT.sub(".", t)
+    """Expand [at]/(at)/{at}/[dot]/… obfuscations so EMAIL_RE can match them."""
+    t = _OBF_AT.sub("@", text)
+    t = _OBF_AT_BARE.sub("@", t)
+    t = _OBF_DOT.sub(".", t)
     return t
 
 
@@ -109,8 +119,16 @@ SUBPAGES = [
     "/schedule", "/contact.html", "/about.html",
 ]
 
-REQUEST_TIMEOUT = 5
+# Fetched first, in this order — named contacts live on /contact and /team far
+# more often than anywhere else.
+PRIORITY_SUBPAGES = ["/contact", "/contact-us", "/about", "/team"]
+
+REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
 MAX_ATTEMPTS = 2
+# How many pages that actually load are read per domain before we stop.
+MAX_PAGES_PER_DOMAIN = int(os.environ.get("MAX_PAGES_PER_DOMAIN", "4"))
+# Bounds wasted requests on sites where most subpages 404.
+_MAX_FETCH_ATTEMPTS_MULTIPLIER = 3
 
 
 @dataclass(frozen=True)
@@ -121,6 +139,10 @@ class EmailScrapeResult:
     """When email is None: 'no_email_found' or 'only_generic_email'."""
     city: str | None = None
     """City name inferred from the business website, when not already known."""
+    all_emails: str | None = None
+    """Every plausible candidate found, comma-joined, deduped, best-first."""
+    signals: dict | None = None
+    """Ad-tech fingerprints from detect_signals(), merged across all pages read."""
 
 
 # Consumer / free-mail hosts — kept as candidates but ranked below same-site addresses.
@@ -136,6 +158,63 @@ _JUNK_EMAIL_DOMAIN_SUFFIXES = (
     ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
     ".css", ".js", ".json", ".woff", ".woff2",
 )
+
+
+# ---------------------------------------------------------------------------
+# Ad-tech / call-tracking fingerprints
+# ---------------------------------------------------------------------------
+
+_RE_GOOGLE_ADS = re.compile(
+    r"AW-\d{9,}|googleadservices\.com/pagead/conversion|google_conversion_id"
+    r"|gtag\(\s*['\"]config['\"]\s*,\s*['\"]AW-",
+    re.I,
+)
+_RE_AW_IDS   = re.compile(r"AW-(\d{9,})", re.I)
+_RE_CALLRAIL = re.compile(r"(cdn|js)\.callrail\.com", re.I)
+_RE_CTM      = re.compile(r"tctm\.co|calltrackingmetrics\.com", re.I)
+_RE_GTM      = re.compile(r"googletagmanager\.com/gtm\.js", re.I)
+_RE_GA4      = re.compile(r"gtag/js\?id=G-", re.I)
+
+
+def detect_signals(html: str) -> dict:
+    """Fingerprint paid-search and call-tracking stacks in a raw HTML page.
+
+    Runs on the unparsed source so inline <script> bodies are included.
+    """
+    if not html:
+        return {
+            "runs_google_ads": False,
+            "aw_ids": "",
+            "call_tracking": None,
+            "has_gtm": False,
+            "has_ga4": False,
+        }
+    aw_ids = sorted({m.group(1) for m in _RE_AW_IDS.finditer(html)})
+    call_tracking = None
+    if _RE_CALLRAIL.search(html):
+        call_tracking = "callrail"
+    elif _RE_CTM.search(html):
+        call_tracking = "ctm"
+    return {
+        "runs_google_ads": bool(_RE_GOOGLE_ADS.search(html)),
+        "aw_ids": ",".join(aw_ids),
+        "call_tracking": call_tracking,
+        "has_gtm": bool(_RE_GTM.search(html)),
+        "has_ga4": bool(_RE_GA4.search(html)),
+    }
+
+
+def _merge_signals(acc: dict, page: dict) -> dict:
+    """OR the booleans, union the AW ID set, keep the first call-tracking vendor."""
+    ids = set(filter(None, (acc.get("aw_ids") or "").split(",")))
+    ids |= set(filter(None, (page.get("aw_ids") or "").split(",")))
+    return {
+        "runs_google_ads": bool(acc.get("runs_google_ads")) or bool(page.get("runs_google_ads")),
+        "aw_ids": ",".join(sorted(ids)),
+        "call_tracking": acc.get("call_tracking") or page.get("call_tracking"),
+        "has_gtm": bool(acc.get("has_gtm")) or bool(page.get("has_gtm")),
+        "has_ga4": bool(acc.get("has_ga4")) or bool(page.get("has_ga4")),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +410,38 @@ def pick_best_email(
     return None
 
 
+def rank_emails(emails: list[str], website_url: str | None = None) -> list[str]:
+    """Dedupe + drop implausible addresses, best-first by the pick_best_email tiers."""
+    site_host = _site_host_for_match(website_url or "")
+    seen: set[str] = set()
+    ordered: list[str] = []
+    for e in emails:
+        e = (e or "").strip().lower()
+        if not e or e in seen or not is_plausible_email(e):
+            continue
+        seen.add(e)
+        ordered.append(e)
+    return sorted(ordered, key=lambda e: _email_priority_tier(e, site_host))
+
+
+def _extract_cloudflare_emails(soup: BeautifulSoup) -> list[str]:
+    """Decode Cloudflare Email Obfuscation payloads (data-cfemail hex blobs)."""
+    decoded: list[str] = []
+    for tag in soup.select("[data-cfemail]"):
+        encoded = tag.get("data-cfemail")
+        if not isinstance(encoded, str) or len(encoded) < 4:
+            continue
+        try:
+            b = bytes.fromhex(encoded)
+            key = b[0]
+            email = "".join(chr(x ^ key) for x in b[1:])
+            if "@" in email:
+                decoded.append(email.lower())
+        except Exception:
+            continue
+    return decoded
+
+
 def _walk_json_for_emails(obj: Any, out: list[str]) -> None:
     if isinstance(obj, dict):
         for v in obj.values():
@@ -365,6 +476,9 @@ def extract_email_candidates(html: str) -> list[str]:
             _walk_json_for_emails(json.loads(raw), candidates)
         except json.JSONDecodeError:
             continue
+
+    # Must run before decompose() below — that strips the tags carrying the payload.
+    candidates.extend(_extract_cloudflare_emails(soup))
 
     for s in soup(["script", "style", "noscript"]):
         s.decompose()
@@ -421,6 +535,14 @@ def http_get_text(session: requests.Session, url: str) -> str | None:
     return None
 
 
+def _page_urls_for(base: str) -> list[str]:
+    """Homepage first, then the pages named contacts live on, then the long tail."""
+    tail = [p for p in SUBPAGES if p not in PRIORITY_SUBPAGES]
+    return [base] + [
+        urljoin(base + "/", p.lstrip("/")) for p in (PRIORITY_SUBPAGES + tail)
+    ]
+
+
 def scrape_email_for_website(
     website_url: str,
     session: requests.Session,
@@ -430,32 +552,55 @@ def scrape_email_for_website(
     base = normalize_website_url(website_url)
     if not base:
         return EmailScrapeResult(None, "no_email_found")
-    urls = [base] + [urljoin(base + "/", p.lstrip("/")) for p in SUBPAGES]
-    all_emails: list[str] = []
+
+    candidates: list[str] = []
+    signals: dict = detect_signals("")
     any_page_loaded = False
+    pages_read = 0
+    attempts = 0
+    max_attempts = max(
+        len(PRIORITY_SUBPAGES) + 1,
+        MAX_PAGES_PER_DOMAIN * _MAX_FETCH_ATTEMPTS_MULTIPLIER,
+    )
     city_found: str | None = None
-    for url in urls:
+    site_host = _site_host_for_match(website_url)
+
+    for url in _page_urls_for(base):
+        if pages_read >= MAX_PAGES_PER_DOMAIN or attempts >= max_attempts:
+            break
+        attempts += 1
         html = http_get_text(session, url)
         if html is None:
             continue
         any_page_loaded = True
-        all_emails.extend(extract_email_candidates(html))
+        pages_read += 1
+        # Signals are collected from every page, whether or not it yields an email.
+        signals = _merge_signals(signals, detect_signals(html))
+        candidates.extend(extract_email_candidates(html))
         if city_found is None:
             city_found = extract_city_from_html(html)
-        best = pick_best_email(
-            all_emails,
+        # Only a tier-0 hit (named contact on the business's own domain) is worth
+        # stopping for — anything else may still be beaten by a later page.
+        best_so_far = pick_best_email(
+            candidates,
             allow_generic_fallback=allow_generic_fallback,
             website_url=website_url,
         )
-        if best and (allow_generic_fallback or not is_generic_email(best)):
-            return EmailScrapeResult(best, None, city_found)
+        if best_so_far and _email_priority_tier(best_so_far, site_host) == 0:
+            return EmailScrapeResult(
+                best_so_far, None, city_found,
+                ",".join(rank_emails(candidates, website_url)), signals,
+            )
+
+    ranked = rank_emails(candidates, website_url)
+    all_emails_str = ",".join(ranked) or None
     best = pick_best_email(
-        all_emails,
+        candidates,
         allow_generic_fallback=allow_generic_fallback,
         website_url=website_url,
     )
     if best:
-        return EmailScrapeResult(best, None, city_found)
+        return EmailScrapeResult(best, None, city_found, all_emails_str, signals)
 
     # WHOIS fallback — often surfaces the owner's direct registrant email.
     try:
@@ -465,13 +610,13 @@ def scrape_email_for_website(
     if hostname:
         w_email = whois_email_for_domain(hostname)
         if w_email and (allow_generic_fallback or not is_generic_email(w_email)):
-            return EmailScrapeResult(w_email, None, city_found)
+            with_whois = ",".join(rank_emails(ranked + [w_email], website_url)) or None
+            return EmailScrapeResult(w_email, None, city_found, with_whois, signals)
 
     if not any_page_loaded:
-        return EmailScrapeResult(None, "no_email_found", city_found)
-    plausible = [e for e in all_emails if is_plausible_email(e)]
-    if not plausible:
-        return EmailScrapeResult(None, "no_email_found", city_found)
-    if not allow_generic_fallback and all(is_generic_email(e) for e in plausible):
-        return EmailScrapeResult(None, "only_generic_email", city_found)
-    return EmailScrapeResult(None, "no_email_found", city_found)
+        return EmailScrapeResult(None, "no_email_found", city_found, all_emails_str, signals)
+    if not ranked:
+        return EmailScrapeResult(None, "no_email_found", city_found, all_emails_str, signals)
+    if not allow_generic_fallback and all(is_generic_email(e) for e in ranked):
+        return EmailScrapeResult(None, "only_generic_email", city_found, all_emails_str, signals)
+    return EmailScrapeResult(None, "no_email_found", city_found, all_emails_str, signals)
