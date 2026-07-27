@@ -341,10 +341,17 @@
           <span>New Scrape Job</span>
         </div>
         <div class="card-body">
-          <div class="mb-3">
-            <label class="lbl">Keyword</label>
-            <input type="text" class="form-control" id="inp-keyword"
-              placeholder='e.g. "plumbers" or "HVAC contractors"'>
+          <div class="row g-2 mb-3">
+            <div class="col-7">
+              <label class="lbl">Keyword</label>
+              <input type="text" class="form-control" id="inp-keyword"
+                placeholder='e.g. "plumbers" or "HVAC contractors"'>
+            </div>
+            <div class="col-5">
+              <label class="lbl">Vertical <span style="opacity:.6;font-weight:400">(optional)</span></label>
+              <input type="text" class="form-control" id="inp-vertical"
+                placeholder="auto" title="Leave blank to derive from the keyword">
+            </div>
           </div>
 
           <!-- State / Custom zips toggle -->
@@ -589,6 +596,7 @@ function switchZipTab(tab) {
 // ── Start job ──────────────────────────────────────────────────────────────
 async function startJob() {
   const keyword    = document.getElementById('inp-keyword').value.trim();
+  const vertical   = document.getElementById('inp-vertical').value.trim();
   const apiKey     = document.getElementById('inp-apikey').value.trim();
   const state      = document.getElementById('inp-state').value;
   const customZips = document.getElementById('inp-zips').value;
@@ -604,7 +612,7 @@ async function startJob() {
     const res = await fetch('/api/jobs', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({keyword, api_key: apiKey, state, custom_zips: customZips, run_mode: runMode}),
+      body: JSON.stringify({keyword, vertical, api_key: apiKey, state, custom_zips: customZips, run_mode: runMode}),
     });
     const data = await res.json();
     if (!res.ok) {
@@ -665,6 +673,7 @@ async function refreshJobs() {
         <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
           <div>
             <span style="font-weight:600;font-size:0.85rem">${esc(j.keyword)}</span>
+            ${j.vertical && j.vertical !== j.keyword ? `<span class="chip ms-1">${esc(j.vertical)}</span>` : ''}
             ${j.state ? `<span class="chip ms-1">${esc(j.state)}</span>` : ''}
             ${j.run_mode ? `<span class="chip ms-1">${esc(j.run_mode)}</span>` : ''}
           </div>
