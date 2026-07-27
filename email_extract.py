@@ -18,6 +18,26 @@ from bs4 import BeautifulSoup
 
 log = logging.getLogger(__name__)
 
+
+def env_int(name: str, default: int, minimum: int = 1) -> int:
+    """Read an int from the environment, falling back to the default.
+
+    Tolerates values wrapped in quotes and never raises: a stray character in a
+    deployment variable must not crash the process at import, before the web
+    server binds its port.
+    """
+    raw = (os.environ.get(name) or "").strip().strip('"').strip("'").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        if raw:
+            log.warning("Invalid %s=%r — falling back to %d", name, os.environ.get(name), default)
+        return default
+    if value < minimum:
+        log.warning("%s=%d is below the minimum of %d — using %d", name, value, minimum, minimum)
+        return minimum
+    return value
+
 EMAIL_RE = re.compile(
     r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
     re.IGNORECASE,
@@ -123,10 +143,10 @@ SUBPAGES = [
 # more often than anywhere else.
 PRIORITY_SUBPAGES = ["/contact", "/contact-us", "/about", "/team"]
 
-REQUEST_TIMEOUT = int(os.environ.get("REQUEST_TIMEOUT", "10"))
+REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 10)
 MAX_ATTEMPTS = 2
 # How many pages that actually load are read per domain before we stop.
-MAX_PAGES_PER_DOMAIN = int(os.environ.get("MAX_PAGES_PER_DOMAIN", "4"))
+MAX_PAGES_PER_DOMAIN = env_int("MAX_PAGES_PER_DOMAIN", 4)
 # Bounds wasted requests on sites where most subpages 404.
 _MAX_FETCH_ATTEMPTS_MULTIPLIER = 3
 
