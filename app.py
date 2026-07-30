@@ -99,6 +99,18 @@ MAX_JOB_EVENTS  = 200
 MAX_STORED_JOBS = 30
 _job_queue: queue.Queue = queue.Queue()   # (job_id, api_key) tuples
 
+# Bulk stage actions run as background jobs on the same worker as scrapes.
+JOB_TYPE_SCRAPE = "scrape"
+JOB_TYPE_BULK_ENRICH = "bulk_enrich"
+JOB_TYPE_BULK_CLEAN = "bulk_clean"
+_BULK_JOB_TYPES = frozenset({JOB_TYPE_BULK_ENRICH, JOB_TYPE_BULK_CLEAN})
+# Rows per commit / progress event. Also the granularity at which a running
+# bulk job notices a cancel request.
+PROGRESS_CHUNK_ROWS = env_int("PROGRESS_CHUNK_ROWS", 100)
+# A capped batch this small finishes well inside an HTTP timeout, so
+# /api/pipeline/advance still answers inline for test-sized runs.
+BULK_INLINE_MAX_ROWS = env_int("BULK_INLINE_MAX_ROWS", 500)
+
 # ── Place-details probing state (shared across jobs and zips) ─────────────────
 _details_cache: dict[str, dict | None] = {}
 _details_lock = threading.Lock()
@@ -481,10 +493,52 @@ def _scrape_zip(
     return inserted, skipped, geo_rejected, no_website
 
 
+_ENRICH_PROGRESS_KEYS = ("checked", "enriched", "no_email")
+_CLEAN_PROGRESS_KEYS = ("checked", "clean", "flagged", "failed")
+
+
+def _cancel_requested(job_id: str) -> bool:
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        return bool(job and job.get("cancel_requested"))
+
+
+def _stage_progress_reporter(
+    job_id: str, stage: str, counter_key: str, keys: tuple[str, ...], *, drive_bar: bool
+):
+    """Build the progress callback _enrich_stage_rows / _clean_stage_rows call.
+
+    Mirrors each batch's counters onto the job record so /api/jobs shows live
+    numbers, and logs one event per batch. `drive_bar` moves the job's
+    processed/total (used by bulk jobs, where rows are the unit of work); a
+    scrape job keeps its zip-based bar and only gains the counters.
+    """
+
+    def report(done: int, total: int, stats: dict) -> None:
+        snapshot = dict(stats)
+        with _jobs_lock:
+            job = _jobs.get(job_id)
+            if job is None:
+                return
+            job[counter_key] = snapshot
+            if drive_bar:
+                job["processed"] = done
+                job["total"] = total
+        summary = ", ".join(f"{k}={snapshot[k]}" for k in keys if k in snapshot)
+        _job_event(job_id, "info", stage, f"Progress {done}/{total} rows — {summary}.")
+        log.info("[%s-job %s] progress %d/%d %s", stage, job_id, done, total, summary)
+
+    return report
+
+
 def _run_job(job_id: str, api_key: str) -> None:
     with _jobs_lock:
         job = _jobs[job_id]
         job["status"] = "running"
+        job_type = job.get("type", JOB_TYPE_SCRAPE)
+    if job_type in _BULK_JOB_TYPES:
+        _run_bulk_stage_job(job_id, job_type)
+        return
     _job_event(job_id, "info", "scrape", "Job started.")
     with _jobs_lock:
         j = _jobs[job_id]
@@ -524,10 +578,13 @@ def _run_job(job_id: str, api_key: str) -> None:
                     f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup, {geo} off-target, {nw} no-website).",
                 )
         if job.get("run_mode") == "full_pipeline":
+            enrich_progress = _stage_progress_reporter(
+                job_id, "enrich", "enriched", _ENRICH_PROGRESS_KEYS, drive_bar=False
+            )
             _job_event(job_id, "info", "enrich", "Starting enrichment (in-target scraped rows).")
-            e_scraped = _enrich_stage_rows(conn, "scraped", limit=None)
+            e_scraped = _enrich_stage_rows(conn, "scraped", limit=None, progress=enrich_progress)
             _job_event(job_id, "info", "enrich", "Starting enrichment (off-target / geo_rejected rows).")
-            e_geo = _enrich_stage_rows(conn, "geo_rejected", limit=None)
+            e_geo = _enrich_stage_rows(conn, "geo_rejected", limit=None, progress=enrich_progress)
             enriched = {
                 "checked": e_scraped["checked"] + e_geo["checked"],
                 "enriched": e_scraped["enriched"] + e_geo["enriched"],
@@ -539,7 +596,12 @@ def _run_job(job_id: str, api_key: str) -> None:
                 f"(scraped {e_scraped['checked']}, geo_rejected {e_geo['checked']}).",
             )
             _job_event(job_id, "info", "clean", "Starting cleaning stage.")
-            cleaned = _clean_stage_rows(conn, "enriched", limit=None)
+            cleaned = _clean_stage_rows(
+                conn, "enriched", limit=None,
+                progress=_stage_progress_reporter(
+                    job_id, "clean", "cleaned", _CLEAN_PROGRESS_KEYS, drive_bar=False
+                ),
+            )
             _job_event(
                 job_id, "info", "clean",
                 f"Cleaning complete: checked={cleaned['checked']}, clean={cleaned['clean']}, flagged={cleaned['flagged']}, failed={cleaned['failed']}.",
@@ -572,6 +634,73 @@ def _run_job(job_id: str, api_key: str) -> None:
         conn.close()
 
 
+def _run_bulk_stage_job(job_id: str, job_type: str) -> None:
+    """Run a bulk enrich/clean over a pipeline stage on the shared job worker.
+
+    Same contract as a scrape job: live counters on /api/jobs, one event per
+    batch, and a cancel request honoured between batches.
+    """
+    action = "enrich" if job_type == JOB_TYPE_BULK_ENRICH else "clean"
+    counter_key = "enriched" if action == "enrich" else "cleaned"
+    keys = _ENRICH_PROGRESS_KEYS if action == "enrich" else _CLEAN_PROGRESS_KEYS
+
+    with _jobs_lock:
+        job = _jobs[job_id]
+        from_stage = job.get("from_stage") or ""
+        limit = job.get("limit")
+
+    scope = f"limit {limit}" if limit else "no limit"
+    _job_event(job_id, "info", action, f"Bulk {action} started on stage '{from_stage}' ({scope}).")
+    log.info("[bulk-%s job %s] started stage=%s limit=%s", action, job_id, from_stage, limit)
+
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+
+    try:
+        runner = _enrich_stage_rows if action == "enrich" else _clean_stage_rows
+        result = runner(
+            conn,
+            from_stage,
+            limit,
+            progress=_stage_progress_reporter(
+                job_id, action, counter_key, keys, drive_bar=True
+            ),
+            should_cancel=lambda: _cancel_requested(job_id),
+        )
+        summary = ", ".join(f"{k}={result[k]}" for k in keys if k in result)
+        cancelled = bool(result.get("cancelled"))
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job[counter_key] = dict(result)
+            job["processed"] = result["checked"]
+            job["status"] = "cancelled" if cancelled else "completed"
+        if result.get("errors"):
+            _job_event(
+                job_id, "warning", action,
+                f"{result['errors']} row(s) errored and kept their stage — re-run to retry them.",
+            )
+        if cancelled:
+            _job_event(job_id, "info", "job", f"Bulk {action} cancelled after {result['checked']} rows — {summary}.")
+        else:
+            _job_event(job_id, "info", "job", f"Bulk {action} complete: {summary}.")
+        log.info(
+            "[bulk-%s job %s] %s stage=%s %s",
+            action, job_id, "cancelled" if cancelled else "completed", from_stage, summary,
+        )
+    except Exception as exc:
+        log.exception("Bulk %s job %s failed", action, job_id)
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job["status"] = "failed"
+            job["error"] = str(exc)
+        _job_event(job_id, "error", "job", f"Bulk {action} failed: {exc}")
+    finally:
+        with _jobs_lock:
+            _jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        conn.close()
+
+
 def _signal_columns(signals: dict | None) -> tuple:
     """Flatten detect_signals() output into the UPDATE parameter order."""
     s = signals or {}
@@ -584,20 +713,49 @@ def _signal_columns(signals: dict | None) -> tuple:
     )
 
 
-def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | None) -> dict:
-    where = "WHERE pipeline_stage = ? AND website_url IS NOT NULL AND (email IS NULL OR email = '')"
+# Rows worth crawling: still in the source stage, has a site, has no email yet.
+_ENRICH_CANDIDATE_WHERE = (
+    "pipeline_stage = ? AND website_url IS NOT NULL AND (email IS NULL OR email = '')"
+)
+
+
+def _count_stage_rows(
+    conn: sqlite3.Connection, action: str, from_stage: str, limit: int | None
+) -> int:
+    """How many rows a bulk action would touch — used to size the progress bar."""
+    where = _ENRICH_CANDIDATE_WHERE if action == "enrich" else "pipeline_stage = ?"
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM businesses WHERE {where}", (from_stage,)
+    ).fetchone()[0]
+    return min(total, limit) if limit else total
+
+
+def _enrich_stage_rows(
+    conn: sqlite3.Connection,
+    from_stage: str,
+    limit: int | None,
+    *,
+    progress=None,
+    should_cancel=None,
+) -> dict:
+    """Crawl every candidate row in `from_stage` for an email and ad-tech signals.
+
+    Work is done in batches of PROGRESS_CHUNK_ROWS so a long run commits
+    incrementally, reports progress, and can stop between batches. `progress` is
+    called as progress(done, total, stats) after each batch.
+    """
     params = [from_stage]
-    query = "SELECT id, website_url FROM businesses " + where + " ORDER BY id ASC"
+    query = f"SELECT id, website_url FROM businesses WHERE {_ENRICH_CANDIDATE_WHERE} ORDER BY id ASC"
     if limit:
         query += " LIMIT ?"
         params.append(limit)
     rows = conn.execute(query, params).fetchall()
-    if not rows:
-        return {"checked": 0, "enriched": 0, "no_email": 0}
-
-    result_lock = threading.Lock()
-    enriched = 0
-    no_email = 0
+    total = len(rows)
+    stats = {"checked": 0, "enriched": 0, "no_email": 0, "errors": 0, "cancelled": False}
+    if not total:
+        if progress:
+            progress(0, 0, stats)
+        return stats
 
     def task(row):
         row_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
@@ -615,37 +773,50 @@ def _enrich_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | N
             session.close()
 
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as pool:
-        futures = [pool.submit(task, row) for row in rows]
-        for fut in as_completed(futures):
-            row_id, res = fut.result()
-            now = datetime.utcnow().isoformat()
-            sig = _signal_columns(res.signals)
-            if res.email:
-                conn.execute(
-                    "UPDATE businesses SET email=?, all_emails=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=?, "
-                    "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
-                    (res.email, res.all_emails, now, *sig, row_id),
-                )
-                with result_lock:
-                    enriched += 1
-            else:
-                reason = res.stage_reason or "no_email_found"
-                # Signals are written here too: a business running ads with no
-                # discoverable email is still worth knowing about.
-                conn.execute(
-                    "UPDATE businesses SET all_emails=?, pipeline_stage='enrich_failed', stage_reason=?, enriched_at=?, "
-                    "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
-                    (res.all_emails, reason, now, *sig, row_id),
-                )
-                with result_lock:
-                    no_email += 1
-            if res.city:
-                conn.execute(
-                    "UPDATE businesses SET city=? WHERE id=? AND (city IS NULL OR TRIM(city)='')",
-                    (res.city, row_id),
-                )
+        for start in range(0, total, PROGRESS_CHUNK_ROWS):
+            if should_cancel and should_cancel():
+                stats["cancelled"] = True
+                break
+            batch = rows[start : start + PROGRESS_CHUNK_ROWS]
+            futures = [pool.submit(task, row) for row in batch]
+            for fut in as_completed(futures):
+                # One unreachable site must never end a 45k-row run, so every
+                # row is accounted for individually. Rows that raise keep their
+                # current stage and are picked up by the next run.
+                try:
+                    row_id, res = fut.result()
+                    now = datetime.utcnow().isoformat()
+                    sig = _signal_columns(res.signals)
+                    if res.email:
+                        conn.execute(
+                            "UPDATE businesses SET email=?, all_emails=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=?, "
+                            "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
+                            (res.email, res.all_emails, now, *sig, row_id),
+                        )
+                        stats["enriched"] += 1
+                    else:
+                        reason = res.stage_reason or "no_email_found"
+                        # Signals are written here too: a business running ads with no
+                        # discoverable email is still worth knowing about.
+                        conn.execute(
+                            "UPDATE businesses SET all_emails=?, pipeline_stage='enrich_failed', stage_reason=?, enriched_at=?, "
+                            "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
+                            (res.all_emails, reason, now, *sig, row_id),
+                        )
+                        stats["no_email"] += 1
+                    if res.city:
+                        conn.execute(
+                            "UPDATE businesses SET city=? WHERE id=? AND (city IS NULL OR TRIM(city)='')",
+                            (res.city, row_id),
+                        )
+                except Exception as exc:
+                    stats["errors"] += 1
+                    log.warning("Enrichment failed for one row: %s", exc)
+                stats["checked"] += 1
             conn.commit()
-    return {"checked": len(rows), "enriched": enriched, "no_email": no_email}
+            if progress:
+                progress(stats["checked"], total, stats)
+    return stats
 
 
 @lru_cache(maxsize=20000)
@@ -717,32 +888,57 @@ def _classify_clean_stage(row: sqlite3.Row) -> tuple[str, str | None]:
     return "clean", None
 
 
-def _clean_stage_rows(conn: sqlite3.Connection, from_stage: str, limit: int | None) -> dict:
+def _clean_stage_rows(
+    conn: sqlite3.Connection,
+    from_stage: str,
+    limit: int | None,
+    *,
+    progress=None,
+    should_cancel=None,
+) -> dict:
+    """Classify every row in `from_stage` as clean / flagged / clean_failed.
+
+    Batched like _enrich_stage_rows: MX lookups are warmed per batch (has_mx is
+    cached, so the total work is unchanged) rather than all up front, which keeps
+    progress moving instead of stalling on tens of thousands of DNS lookups.
+    """
     query = "SELECT * FROM businesses WHERE pipeline_stage = ? ORDER BY id ASC"
     params = [from_stage]
     if limit:
         query += " LIMIT ?"
         params.append(limit)
     rows = conn.execute(query, params).fetchall()
-    _warm_mx_cache(rows)
-    clean = 0
-    flagged = 0
-    failed = 0
+    total = len(rows)
+    stats = {"checked": 0, "clean": 0, "flagged": 0, "failed": 0, "cancelled": False}
+    if not total:
+        if progress:
+            progress(0, 0, stats)
+        return stats
+
     now = datetime.utcnow().isoformat()
-    for row in rows:
-        stage, reason = _classify_clean_stage(row)
-        conn.execute(
-            "UPDATE businesses SET pipeline_stage=?, stage_reason=?, cleaned_at=? WHERE id=?",
-            (stage, reason, now, row["id"]),
-        )
-        if stage == "clean":
-            clean += 1
-        elif stage == "flagged":
-            flagged += 1
-        else:
-            failed += 1
-    conn.commit()
-    return {"checked": len(rows), "clean": clean, "flagged": flagged, "failed": failed}
+    for start in range(0, total, PROGRESS_CHUNK_ROWS):
+        if should_cancel and should_cancel():
+            stats["cancelled"] = True
+            break
+        batch = rows[start : start + PROGRESS_CHUNK_ROWS]
+        _warm_mx_cache(batch)
+        for row in batch:
+            stage, reason = _classify_clean_stage(row)
+            conn.execute(
+                "UPDATE businesses SET pipeline_stage=?, stage_reason=?, cleaned_at=? WHERE id=?",
+                (stage, reason, now, row["id"]),
+            )
+            if stage == "clean":
+                stats["clean"] += 1
+            elif stage == "flagged":
+                stats["flagged"] += 1
+            else:
+                stats["failed"] += 1
+            stats["checked"] += 1
+        conn.commit()
+        if progress:
+            progress(stats["checked"], total, stats)
+    return stats
 
 
 def _job_event(job_id: str, level: str, stage: str, message: str) -> None:
@@ -812,16 +1008,32 @@ def list_jobs():
 
 @app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
 def cancel_job(job_id: str):
+    """Cancel a queued job, or ask a running bulk stage job to stop.
+
+    A running bulk job stops between batches, so rows already processed keep
+    their new stage — cancelling costs at most PROGRESS_CHUNK_ROWS of in-flight
+    work. Running scrape jobs remain uncancellable.
+    """
     with _jobs_lock:
         job = _jobs.get(job_id)
         if not job:
             return jsonify({"error": "Job not found"}), 404
-        if job["status"] != "queued":
-            return jsonify({"error": f"Cannot cancel a job with status '{job['status']}'"}), 409
-        job["status"] = "cancelled"
-        job["completed_at"] = datetime.utcnow().isoformat()
+        status = job["status"]
+        is_bulk = job.get("type") in _BULK_JOB_TYPES
+        if status == "queued":
+            job["status"] = "cancelled"
+            job["completed_at"] = datetime.utcnow().isoformat()
+            pending = False
+        elif status == "running" and is_bulk:
+            job["cancel_requested"] = True
+            pending = True
+        else:
+            return jsonify({"error": f"Cannot cancel a job with status '{status}'"}), 409
+    if pending:
+        _job_event(job_id, "info", "job", "Cancel requested — stopping after the current batch.")
+        return jsonify({"ok": True, "pending": True})
     _job_event(job_id, "info", "job", "Job cancelled by user.")
-    return jsonify({"ok": True})
+    return jsonify({"ok": True, "pending": False})
 
 
 @app.route("/api/jobs/<job_id>/events", methods=["GET"])
@@ -872,11 +1084,14 @@ def start_job():
     vertical = vertical or vertical_for_keyword(keyword)
     job = {
         "id":                  str(uuid.uuid4())[:8],
+        "type":                JOB_TYPE_SCRAPE,
+        "unit":                "zips",
         "keyword":             keyword,
         "vertical":            vertical,
         "state":               state,
         "zip_codes":           zips,
         "status":              "queued",
+        "cancel_requested":    False,
         "total":               len(zips),
         "processed":           0,
         "inserted":            0,
@@ -1091,6 +1306,13 @@ def _build_where(min_rating: float, min_reviews: int, has_email: bool, category:
 
 @app.route("/api/pipeline/advance", methods=["POST"])
 def advance_pipeline():
+    """Advance a whole pipeline stage — inline for small capped batches, else a job.
+
+    Enriching tens of thousands of rows takes hours, far longer than any HTTP
+    timeout, so an uncapped run is queued on the job worker and this returns a
+    job_id straight away. A limit of BULK_INLINE_MAX_ROWS or fewer still runs
+    inline and returns its counts, so test batches behave as before.
+    """
     data = request.get_json(force=True)
     from_stage = (data.get("from_stage") or "").strip()
     action = (data.get("action") or "").strip()  # enrich or clean
@@ -1107,15 +1329,65 @@ def advance_pipeline():
     except (TypeError, ValueError):
         return jsonify({"error": "limit must be a number"}), 400
 
+    if limit is not None and limit <= BULK_INLINE_MAX_ROWS:
+        conn = get_conn()
+        try:
+            runner = _enrich_stage_rows if action == "enrich" else _clean_stage_rows
+            result = runner(conn, from_stage, limit)
+            return jsonify({
+                "ok": True, "mode": "inline", "action": action,
+                "from_stage": from_stage, "result": result,
+            })
+        finally:
+            conn.close()
+
     conn = get_conn()
     try:
-        if action == "enrich":
-            result = _enrich_stage_rows(conn, from_stage, limit)
-        else:
-            result = _clean_stage_rows(conn, from_stage, limit)
-        return jsonify({"ok": True, "action": action, "from_stage": from_stage, "result": result})
+        total = _count_stage_rows(conn, action, from_stage, limit)
     finally:
         conn.close()
+
+    job_type = JOB_TYPE_BULK_ENRICH if action == "enrich" else JOB_TYPE_BULK_CLEAN
+    now = datetime.utcnow().isoformat()
+    job = {
+        "id":               str(uuid.uuid4())[:8],
+        "type":             job_type,
+        "unit":             "rows",
+        # The UI titles a job card with `keyword`; name it after the work.
+        "keyword":          f"{action} · {from_stage}",
+        "vertical":         "",
+        "state":            "",
+        "from_stage":       from_stage,
+        "limit":            limit,
+        "action":           action,
+        "status":           "queued",
+        "cancel_requested": False,
+        "total":            total,
+        "processed":        0,
+        "inserted":         0,
+        "duplicates":       0,
+        "queued_at":        now,
+        "started_at":       now,
+        "completed_at":     None,
+        "error":            None,
+        "run_mode":         job_type,
+        "enriched":         None,
+        "cleaned":          None,
+        "events":           [],
+    }
+
+    with _jobs_lock:
+        _jobs[job["id"]] = job
+    _job_event(
+        job["id"], "info", "job",
+        f"Bulk {action} queued for stage '{from_stage}' — {total} candidate row(s)"
+        + (f", limit {limit}." if limit else "."),
+    )
+    _job_queue.put((job["id"], ""))
+    return jsonify({
+        "ok": True, "mode": "job", "job_id": job["id"], "action": action,
+        "from_stage": from_stage, "total": total,
+    }), 202
 
 
 @app.route("/api/stages")
