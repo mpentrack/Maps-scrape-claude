@@ -418,6 +418,7 @@
               <option value="geo_rejected">geo_rejected (off-target)</option>
               <option value="enrich_failed">enrich_failed</option>
               <option value="enriched">enriched</option>
+              <option value="archived">archived</option>
             </select>
           </div>
           <div class="mb-2">
@@ -425,8 +426,13 @@
             <input type="number" class="form-control" id="bulk-limit" min="1" placeholder="e.g. 500">
           </div>
           <div class="d-grid gap-2">
-            <button class="btn-ghost" onclick="advanceStage('enrich')">Run Enrichment on Stage</button>
-            <button class="btn-ghost" onclick="advanceStage('clean')">Run Cleaning on Stage</button>
+            <button class="btn-ghost" id="btn-bulk-enrich" onclick="advanceStage('enrich')">Run Enrichment on Stage</button>
+            <button class="btn-ghost" id="btn-bulk-clean" onclick="advanceStage('clean')">Run Cleaning on Stage</button>
+          </div>
+          <div class="mt-2" style="font-size:0.72rem;color:var(--muted);line-height:1.5">
+            No limit (or over 500) runs as a background job — watch it in Jobs and
+            cancel it there. Enriching <code>archived</code> moves rows that gain an
+            email out of <code>archived</code>.
           </div>
           <div id="bulk-msg" class="mt-2" style="font-size:0.78rem;color:var(--muted)"></div>
         </div>
@@ -658,6 +664,33 @@ async function refreshJobs() {
       running:'var(--accent)', completed:'var(--green)', failed:'var(--red)',
       queued:'#d29922', cancelled:'var(--muted)', pending:'var(--orange)',
     }[j.status] || 'var(--muted)';
+    // Bulk stage jobs count rows, not zips, so they get their own counter line.
+    const isBulk    = j.type === 'bulk_enrich' || j.type === 'bulk_clean';
+    const canCancel = j.status === 'queued' || (j.status === 'running' && isBulk);
+    const n = v => (v == null ? 0 : v).toLocaleString();
+    let counters;
+    if (isBulk) {
+      const s = (j.type === 'bulk_enrich' ? j.enriched : j.cleaned) || {};
+      counters =
+        `<span>${n(j.processed)}/${n(j.total)} rows</span>` +
+        (j.type === 'bulk_enrich'
+          ? `<span style="color:var(--green)">${n(s.enriched)} enriched</span>` +
+            `<span>${n(s.no_email)} no email</span>`
+          : `<span style="color:var(--green)">${n(s.clean)} clean</span>` +
+            `<span style="color:var(--orange)">${n(s.flagged)} flagged</span>` +
+            `<span>${n(s.failed)} failed</span>`) +
+        (s.errors ? `<span style="color:var(--red)">${n(s.errors)} errored</span>` : '');
+    } else {
+      counters =
+        `<span>${n(j.processed)}/${n(j.total)} zips</span>` +
+        `<span style="color:var(--green)">+${n(j.inserted)} new</span>` +
+        `<span>${n(j.duplicates)} dup</span>` +
+        ((j.geo_rejected != null && j.geo_rejected > 0)
+          ? `<span style="color:var(--orange)" title="Rows saved with stage geo_rejected — filter Pipeline Stage">${n(j.geo_rejected)} off-target</span>`
+          : '') +
+        (j.enriched ? `<span>enriched ${n(j.enriched.enriched)}/${n(j.enriched.checked)}</span>` : '') +
+        (j.cleaned  ? `<span>clean ${n(j.cleaned.clean)}/${n(j.cleaned.checked)}</span>` : '');
+    }
     const events = Array.isArray(j.events) ? j.events : [];
     const isExpanded = expandedJobLogs.has(j.id);
     const visible = isExpanded ? events : events.slice(-4);
@@ -678,8 +711,8 @@ async function refreshJobs() {
             ${j.run_mode ? `<span class="chip ms-1">${esc(j.run_mode)}</span>` : ''}
           </div>
           <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
-            ${j.status === 'queued' ? `<button onclick="cancelJob('${esc(j.id)}')"
-              title="Cancel queued job"
+            ${canCancel ? `<button onclick="cancelJob('${esc(j.id)}')"
+              title="${j.status === 'running' ? 'Stop after the current batch of rows' : 'Cancel queued job'}"
               style="background:transparent;border:1px solid var(--muted);color:var(--muted);
                      border-radius:4px;padding:1px 6px;font-size:0.7rem;cursor:pointer;line-height:1.4"
               onmouseover="this.style.borderColor='var(--red)';this.style.color='var(--red)'"
@@ -690,13 +723,8 @@ async function refreshJobs() {
         <div class="prog-track">
           <div class="prog-fill" style="width:${pct}%;background:${color}"></div>
         </div>
-        <div style="display:flex;gap:12px;font-size:0.73rem;color:var(--muted)">
-          <span>${j.processed}/${j.total} zips</span>
-          <span style="color:var(--green)">+${j.inserted.toLocaleString()} new</span>
-          <span>${j.duplicates.toLocaleString()} dup</span>
-          ${(j.geo_rejected != null && j.geo_rejected > 0) ? `<span style="color:var(--orange)" title="Rows saved with stage geo_rejected — filter Pipeline Stage">` + j.geo_rejected.toLocaleString() + ` off-target</span>` : ''}
-          ${j.enriched ? `<span>enriched ${j.enriched.enriched || 0}/${j.enriched.checked || 0}</span>` : ''}
-          ${j.cleaned ? `<span>clean ${j.cleaned.clean || 0}/${j.cleaned.checked || 0}</span>` : ''}
+        <div style="display:flex;gap:12px;font-size:0.73rem;color:var(--muted);flex-wrap:wrap">
+          ${counters}
           <span style="margin-left:auto">${pct}%</span>
         </div>
         ${queuePos ? `<div style="font-size:0.72rem;color:#d29922;margin-top:2px">Waiting: #${queuePos} in queue</div>` : ''}
@@ -855,25 +883,48 @@ async function advanceStage(action) {
   const fromStage = document.getElementById('bulk-stage').value;
   const limitRaw = document.getElementById('bulk-limit').value.trim();
   const msg = document.getElementById('bulk-msg');
-  msg.textContent = 'Running...';
+  const buttons = [
+    document.getElementById('btn-bulk-enrich'),
+    document.getElementById('btn-bulk-clean'),
+  ];
   const payload = {action, from_stage: fromStage};
   if (limitRaw) payload.limit = Number(limitRaw);
 
-  const res = await fetch('/api/pipeline/advance', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify(payload),
-  });
-  const data = await res.json();
-  if (!res.ok) {
+  buttons.forEach(b => b.disabled = true);
+  msg.style.color = 'var(--muted)';
+  msg.textContent = 'Submitting...';
+  try {
+    const res = await fetch('/api/pipeline/advance', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      msg.style.color = 'var(--red)';
+      msg.textContent = data.error || 'Bulk action failed';
+      return;
+    }
+    if (data.mode === 'job') {
+      // Uncapped run — the work happens on the job worker, not this request.
+      msg.style.color = 'var(--accent)';
+      msg.textContent =
+        `${action} queued as job ${data.job_id} — ${data.total.toLocaleString()} rows. ` +
+        `Track progress (and cancel) in Jobs.`;
+      await refreshJobs();
+      ensurePolling();
+      return;
+    }
+    msg.style.color = 'var(--green)';
+    msg.textContent = `${action} finished: ${JSON.stringify(data.result)}`;
+    await refreshStats();
+    await loadLeads(currentPage);
+  } catch (e) {
     msg.style.color = 'var(--red)';
-    msg.textContent = data.error || 'Bulk action failed';
-    return;
+    msg.textContent = 'Bulk action failed: ' + e;
+  } finally {
+    buttons.forEach(b => b.disabled = false);
   }
-  msg.style.color = 'var(--green)';
-  msg.textContent = `${action} finished: ${JSON.stringify(data.result)}`;
-  await refreshStats();
-  await loadLeads(currentPage);
 }
 
 // ── Archive ────────────────────────────────────────────────────────────────
