@@ -1006,6 +1006,16 @@ def list_jobs():
     return jsonify(sorted(jobs, key=lambda x: x["started_at"], reverse=True))
 
 
+@app.route("/api/jobs/<job_id>", methods=["GET"])
+def get_job(job_id: str):
+    """One job by id, so a poller doesn't have to pull the whole job list."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        return jsonify({k: v for k, v in job.items() if k != "zip_codes"})
+
+
 @app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
 def cancel_job(job_id: str):
     """Cancel a queued job, or ask a running bulk stage job to stop.
