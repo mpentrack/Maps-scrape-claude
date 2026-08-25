@@ -145,6 +145,10 @@ PRIORITY_SUBPAGES = ["/contact", "/contact-us", "/about", "/team"]
 
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 10)
 MAX_ATTEMPTS = 2
+# Never let one unusually large page consume the Railway container. The body is
+# streamed and truncated before decoding/BeautifulSoup parsing, so this is a
+# real memory bound rather than a check performed after the download.
+MAX_RESPONSE_BYTES = env_int("MAX_RESPONSE_BYTES", 2 * 1024 * 1024)
 # How many pages that actually load are read per domain before we stop.
 MAX_PAGES_PER_DOMAIN = env_int("MAX_PAGES_PER_DOMAIN", 4)
 # Bounds wasted requests on sites where most subpages 404.
@@ -537,8 +541,14 @@ def extract_email_candidates(html: str) -> list[str]:
 def http_get_text(session: requests.Session, url: str) -> str | None:
     """GET with retries; None on hard failure. Skips retrying 404."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        resp = None
         try:
-            resp = session.get(url, timeout=REQUEST_TIMEOUT, allow_redirects=True)
+            resp = session.get(
+                url,
+                timeout=REQUEST_TIMEOUT,
+                allow_redirects=True,
+                stream=True,
+            )
             if resp.status_code == 404:
                 return None
             if resp.status_code in (429, 503):
@@ -547,11 +557,40 @@ def http_get_text(session: requests.Session, url: str) -> str | None:
                 time.sleep(wait)
                 continue
             resp.raise_for_status()
-            return resp.text
+            content_type = (resp.headers.get("Content-Type") or "").lower()
+            if content_type and not any(
+                marker in content_type for marker in ("text/", "html", "xhtml", "xml")
+            ):
+                log.debug("Skipping non-HTML content %s on %s", content_type, url)
+                return None
+
+            body = bytearray()
+            truncated = False
+            for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if not chunk:
+                    continue
+                remaining = MAX_RESPONSE_BYTES - len(body)
+                if remaining <= 0:
+                    truncated = True
+                    break
+                body.extend(chunk[:remaining])
+                if len(chunk) > remaining or len(body) >= MAX_RESPONSE_BYTES:
+                    truncated = True
+                    break
+            if truncated:
+                log.debug("Truncated oversized page at %d bytes — %s", MAX_RESPONSE_BYTES, url)
+            encoding = resp.encoding or "utf-8"
+            try:
+                return bytes(body).decode(encoding, errors="replace")
+            except LookupError:
+                return bytes(body).decode("utf-8", errors="replace")
         except requests.Timeout:
             log.debug("Timeout (%d/%d) — %s", attempt, MAX_ATTEMPTS, url)
         except requests.RequestException as exc:
             log.debug("Request error (%d/%d) %s — %s", attempt, MAX_ATTEMPTS, url, exc)
+        finally:
+            if resp is not None:
+                resp.close()
     return None
 
 

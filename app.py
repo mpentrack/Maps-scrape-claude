@@ -47,9 +47,16 @@ API_BASE    = f"https://{API_HOST}"
 PAGE_SIZE   = 20
 MAX_PAGES   = 10
 MAX_RETRIES = 6
-JOB_WORKERS = 5   # concurrent zips per job
-ENRICH_WORKERS = env_int("ENRICH_WORKERS", 20)
-MX_WORKERS = env_int("MX_WORKERS", 20)
+# Keep the defaults deliberately modest for Railway's memory-constrained
+# containers. Every enrichment worker can hold a parsed HTML document, and a
+# scrape worker can hold a Maps search + place-details response.
+JOB_WORKERS = env_int("JOB_WORKERS", 3)
+ENRICH_WORKERS = env_int("ENRICH_WORKERS", 8)
+MX_WORKERS = env_int("MX_WORKERS", 10)
+MAX_QUEUED_JOBS = env_int("MAX_QUEUED_JOBS", 20)
+MAX_ZIPS_PER_JOB = env_int("MAX_ZIPS_PER_JOB", 5000)
+MAX_REQUEST_BYTES = env_int("MAX_REQUEST_BYTES", 262_144)
+app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 APPEND_ZIP_TO_QUERY = os.environ.get("APPEND_ZIP_TO_QUERY", "1").strip().lower() not in ("0", "false", "no", "off")
 # When false (default), do not store info@ / hello@ / etc. if that is all the site exposes.
 EMAIL_ALLOW_GENERIC_FALLBACK = os.environ.get("EMAIL_ALLOW_GENERIC_FALLBACK", "0").strip().lower() in (
@@ -97,7 +104,7 @@ _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
 MAX_JOB_EVENTS  = 200
 MAX_STORED_JOBS = 30
-_job_queue: queue.Queue = queue.Queue()   # (job_id, api_key) tuples
+_job_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUED_JOBS)   # (job_id, api_key) tuples
 
 # Bulk stage actions run as background jobs on the same worker as scrapes.
 JOB_TYPE_SCRAPE = "scrape"
@@ -115,7 +122,7 @@ BULK_INLINE_MAX_ROWS = env_int("BULK_INLINE_MAX_ROWS", 500)
 _details_cache: dict[str, dict | None] = {}
 _details_lock = threading.Lock()
 _DETAIL_COMBO: tuple[str, str] | None = None   # (endpoint, param key) once one works
-MAX_DETAILS_CACHE = 5000
+MAX_DETAILS_CACHE = env_int("MAX_DETAILS_CACHE", 1000)
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -181,6 +188,12 @@ def init_db() -> None:
     }.items():
         if col not in cols:
             conn.execute(ddl)
+    # Background stages page by (pipeline_stage, id). Create this after the
+    # column migrations so older databases can upgrade safely.
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_businesses_stage_id
+        ON businesses (pipeline_stage, id)
+    """)
     conn.execute("UPDATE businesses SET pipeline_stage='scraped' WHERE pipeline_stage IS NULL OR pipeline_stage=''")
     if city_was_new:
         for row in conn.execute(
@@ -744,13 +757,7 @@ def _enrich_stage_rows(
     incrementally, reports progress, and can stop between batches. `progress` is
     called as progress(done, total, stats) after each batch.
     """
-    params = [from_stage]
-    query = f"SELECT id, website_url FROM businesses WHERE {_ENRICH_CANDIDATE_WHERE} ORDER BY id ASC"
-    if limit:
-        query += " LIMIT ?"
-        params.append(limit)
-    rows = conn.execute(query, params).fetchall()
-    total = len(rows)
+    total = _count_stage_rows(conn, "enrich", from_stage, limit)
     stats = {"checked": 0, "enriched": 0, "no_email": 0, "errors": 0, "cancelled": False}
     if not total:
         if progress:
@@ -772,12 +779,26 @@ def _enrich_stage_rows(
         finally:
             session.close()
 
+    # Keyset pagination is important here. The production database can contain
+    # well over 100k rows; fetchall() made a supposedly batched job materialize
+    # the entire stage before its first batch and could push Railway over its
+    # memory limit. Only one bounded chunk now exists in memory at a time.
+    last_id = 0
     with ThreadPoolExecutor(max_workers=ENRICH_WORKERS) as pool:
-        for start in range(0, total, PROGRESS_CHUNK_ROWS):
+        while stats["checked"] < total:
             if should_cancel and should_cancel():
                 stats["cancelled"] = True
                 break
-            batch = rows[start : start + PROGRESS_CHUNK_ROWS]
+            batch_size = min(PROGRESS_CHUNK_ROWS, total - stats["checked"])
+            batch = conn.execute(
+                f"SELECT id, website_url FROM businesses "
+                f"WHERE {_ENRICH_CANDIDATE_WHERE} AND id > ? "
+                "ORDER BY id ASC LIMIT ?",
+                (from_stage, last_id, batch_size),
+            ).fetchall()
+            if not batch:
+                break
+            last_id = batch[-1]["id"]
             futures = [pool.submit(task, row) for row in batch]
             for fut in as_completed(futures):
                 # One unreachable site must never end a 45k-row run, so every
@@ -902,13 +923,7 @@ def _clean_stage_rows(
     cached, so the total work is unchanged) rather than all up front, which keeps
     progress moving instead of stalling on tens of thousands of DNS lookups.
     """
-    query = "SELECT * FROM businesses WHERE pipeline_stage = ? ORDER BY id ASC"
-    params = [from_stage]
-    if limit:
-        query += " LIMIT ?"
-        params.append(limit)
-    rows = conn.execute(query, params).fetchall()
-    total = len(rows)
+    total = _count_stage_rows(conn, "clean", from_stage, limit)
     stats = {"checked": 0, "clean": 0, "flagged": 0, "failed": 0, "cancelled": False}
     if not total:
         if progress:
@@ -916,11 +931,23 @@ def _clean_stage_rows(
         return stats
 
     now = datetime.utcnow().isoformat()
-    for start in range(0, total, PROGRESS_CHUNK_ROWS):
+    last_id = 0
+    while stats["checked"] < total:
         if should_cancel and should_cancel():
             stats["cancelled"] = True
             break
-        batch = rows[start : start + PROGRESS_CHUNK_ROWS]
+        batch_size = min(PROGRESS_CHUNK_ROWS, total - stats["checked"])
+        # Cleaning only reads these three columns. Selecting every column for
+        # an entire archived stage retained large address/email/signal strings
+        # that the classifier never uses.
+        batch = conn.execute(
+            "SELECT id, business_name, email FROM businesses "
+            "WHERE pipeline_stage = ? AND id > ? ORDER BY id ASC LIMIT ?",
+            (from_stage, last_id, batch_size),
+        ).fetchall()
+        if not batch:
+            break
+        last_id = batch[-1]["id"]
         _warm_mx_cache(batch)
         for row in batch:
             stage, reason = _classify_clean_stage(row)
@@ -955,6 +982,30 @@ def _job_event(job_id: str, level: str, stage: str, message: str) -> None:
         })
         if len(events) > MAX_JOB_EVENTS:
             del events[: len(events) - MAX_JOB_EVENTS]
+
+
+def _enqueue_job(job: dict, api_key: str, queued_message: str) -> bool:
+    """Store and enqueue a job without allowing an unbounded backlog.
+
+    The old unbounded Queue accepted work faster than the single consumer could
+    drain it. A busy or accidentally repeated submission could therefore keep
+    growing process memory until Railway killed the container. Callers receive
+    False and can return HTTP 429 when the configured backlog is full.
+    """
+    with _jobs_lock:
+        _jobs[job["id"]] = job
+    _job_event(job["id"], "info", "job", queued_message)
+    try:
+        _job_queue.put_nowait((job["id"], api_key))
+    except queue.Full:
+        with _jobs_lock:
+            _jobs.pop(job["id"], None)
+        log.warning(
+            "Rejected job %s because the queue reached MAX_QUEUED_JOBS=%d",
+            job["id"], MAX_QUEUED_JOBS,
+        )
+        return False
+    return True
 
 
 def _prune_old_jobs() -> None:
@@ -994,6 +1045,31 @@ def _queue_worker() -> None:
 @app.route("/")
 def index():
     return render_template("index.html", states=STATE_NAMES)
+
+
+@app.route("/health")
+def health():
+    """Cheap Railway health check with non-sensitive queue diagnostics."""
+    conn = get_conn()
+    try:
+        conn.execute("SELECT 1").fetchone()
+    finally:
+        conn.close()
+    with _jobs_lock:
+        active = sum(j["status"] in {"queued", "running"} for j in _jobs.values())
+    return jsonify({
+        "ok": True,
+        "active_jobs": active,
+        "queue_depth": _job_queue.qsize(),
+        "queue_capacity": MAX_QUEUED_JOBS,
+    })
+
+
+@app.errorhandler(413)
+def request_too_large(_error):
+    return jsonify({
+        "error": f"Request is too large (maximum {MAX_REQUEST_BYTES:,} bytes).",
+    }), 413
 
 
 @app.route("/api/jobs", methods=["GET"])
@@ -1079,6 +1155,17 @@ def start_job():
         return jsonify({"error": "No zip codes found"}), 400
 
     zips = list(dict.fromkeys(zips))  # deduplicate
+    invalid_zips = [z for z in zips if not re.fullmatch(r"\d{5}", z)]
+    if invalid_zips:
+        sample = ", ".join(invalid_zips[:3])
+        return jsonify({"error": f"ZIP codes must contain exactly five digits: {sample}"}), 400
+    if len(zips) > MAX_ZIPS_PER_JOB:
+        return jsonify({
+            "error": (
+                f"This job contains {len(zips):,} ZIP codes; the per-job maximum is "
+                f"{MAX_ZIPS_PER_JOB:,}. Split it into smaller jobs."
+            ),
+        }), 400
     if run_mode not in {"scrape_only", "full_pipeline"}:
         return jsonify({"error": "Invalid run mode"}), 400
     vertical = vertical or vertical_for_keyword(keyword)
@@ -1108,14 +1195,19 @@ def start_job():
         "events":              [],
     }
 
-    with _jobs_lock:
-        _jobs[job["id"]] = job
-    _job_event(
-        job["id"], "info", "job",
-        f"Job queued ({run_mode}). Keyword='{keyword}'. Vertical='{vertical}'. Target zips={len(zips)}.",
+    queued_message = (
+        f"Job queued ({run_mode}). Keyword='{keyword}'. Vertical='{vertical}'. "
+        f"Target zips={len(zips)}."
     )
-
-    _job_queue.put((job["id"], api_key))
+    if not _enqueue_job(job, api_key, queued_message):
+        response = jsonify({
+            "error": (
+                f"The job queue is full ({MAX_QUEUED_JOBS} waiting). "
+                "Let an existing job finish or cancel one before adding another."
+            ),
+        })
+        response.headers["Retry-After"] = "30"
+        return response, 429
     return jsonify({"id": job["id"]}), 202
 
 
@@ -1376,14 +1468,19 @@ def advance_pipeline():
         "events":           [],
     }
 
-    with _jobs_lock:
-        _jobs[job["id"]] = job
-    _job_event(
-        job["id"], "info", "job",
+    queued_message = (
         f"Bulk {action} queued for stage '{from_stage}' — {total} candidate row(s)"
-        + (f", limit {limit}." if limit else "."),
+        + (f", limit {limit}." if limit else ".")
     )
-    _job_queue.put((job["id"], ""))
+    if not _enqueue_job(job, "", queued_message):
+        response = jsonify({
+            "error": (
+                f"The job queue is full ({MAX_QUEUED_JOBS} waiting). "
+                "Let an existing job finish or cancel one before adding another."
+            ),
+        })
+        response.headers["Retry-After"] = "30"
+        return response, 429
     return jsonify({
         "ok": True, "mode": "job", "job_id": job["id"], "action": action,
         "from_stage": from_stage, "total": total,
