@@ -19,7 +19,12 @@ from bs4 import BeautifulSoup
 log = logging.getLogger(__name__)
 
 
-def env_int(name: str, default: int, minimum: int = 1) -> int:
+def env_int(
+    name: str,
+    default: int,
+    minimum: int = 1,
+    maximum: int | None = None,
+) -> int:
     """Read an int from the environment, falling back to the default.
 
     Tolerates values wrapped in quotes and never raises: a stray character in a
@@ -36,6 +41,9 @@ def env_int(name: str, default: int, minimum: int = 1) -> int:
     if value < minimum:
         log.warning("%s=%d is below the minimum of %d — using %d", name, value, minimum, minimum)
         return minimum
+    if maximum is not None and value > maximum:
+        log.warning("%s=%d is above the maximum of %d — using %d", name, value, maximum, maximum)
+        return maximum
     return value
 
 EMAIL_RE = re.compile(
@@ -143,14 +151,14 @@ SUBPAGES = [
 # more often than anywhere else.
 PRIORITY_SUBPAGES = ["/contact", "/contact-us", "/about", "/team"]
 
-REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 10)
+REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 10, maximum=30)
 MAX_ATTEMPTS = 2
 # Never let one unusually large page consume the Railway container. The body is
 # streamed and truncated before decoding/BeautifulSoup parsing, so this is a
 # real memory bound rather than a check performed after the download.
-MAX_RESPONSE_BYTES = env_int("MAX_RESPONSE_BYTES", 2 * 1024 * 1024)
+MAX_RESPONSE_BYTES = env_int("MAX_RESPONSE_BYTES", 512 * 1024, maximum=1024 * 1024)
 # How many pages that actually load are read per domain before we stop.
-MAX_PAGES_PER_DOMAIN = env_int("MAX_PAGES_PER_DOMAIN", 4)
+MAX_PAGES_PER_DOMAIN = env_int("MAX_PAGES_PER_DOMAIN", 3, maximum=4)
 # Bounds wasted requests on sites where most subpages 404.
 _MAX_FETCH_ATTEMPTS_MULTIPLIER = 3
 
@@ -290,10 +298,7 @@ def _city_from_jsonld(obj: Any) -> str | None:
     return None
 
 
-def extract_city_from_html(html: str) -> str | None:
-    """Return the most likely city name for the business, or None."""
-    soup = BeautifulSoup(html, "html.parser")
-
+def _city_from_soup(soup: BeautifulSoup) -> str | None:
     # 1. JSON-LD structured data — most reliable source.
     for script in soup.find_all("script", attrs={"type": lambda t: t and "ld+json" in str(t).lower()}):
         raw = (script.string or script.get_text() or "").strip()
@@ -312,10 +317,14 @@ def extract_city_from_html(html: str) -> str | None:
         if text and text.lower() not in _CITY_STOP_WORDS and len(text) >= 2:
             return text.title()
 
-    # 3. Regex scan for "City, ST" pattern in visible text.
-    for s in soup(["script", "style", "noscript"]):
-        s.decompose()
-    page_text = soup.get_text(" ")
+    # 3. Regex scan for "City, ST" pattern in visible text. Do not mutate the
+    # soup here: the same parsed tree is reused for email extraction below.
+    page_text = " ".join(
+        text
+        for node in soup.find_all(string=True)
+        if node.parent and node.parent.name not in {"script", "style", "noscript"}
+        and (text := str(node).strip())
+    )
     for m in _CITY_STATE_RE.finditer(page_text):
         city_candidate = m.group(1).strip()
         state_candidate = m.group(2).upper()
@@ -323,6 +332,17 @@ def extract_city_from_html(html: str) -> str | None:
             return city_candidate.title()
 
     return None
+
+
+def extract_city_from_html(html: str) -> str | None:
+    """Return the most likely city name for the business, or None."""
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        return _city_from_soup(soup)
+    finally:
+        # BeautifulSoup creates reference cycles. Decompose immediately so a
+        # long enrichment run does not wait for a later cyclic-GC pass.
+        soup.decompose()
 
 
 def normalize_website_url(url: str) -> str:
@@ -478,9 +498,7 @@ def _walk_json_for_emails(obj: Any, out: list[str]) -> None:
             out.append(m.group(0).lower())
 
 
-def extract_email_candidates(html: str) -> list[str]:
-    """Collect unique emails: mailto, JSON-LD, visible text, stripped HTML, and common attributes."""
-    soup = BeautifulSoup(html, "html.parser")
+def _email_candidates_from_soup(soup: BeautifulSoup, raw_html: str) -> list[str]:
     candidates: list[str] = []
 
     for tag in soup.find_all("a", href=True):
@@ -517,8 +535,9 @@ def extract_email_candidates(html: str) -> list[str]:
         for m in EMAIL_RE.finditer(normalized):
             candidates.append(m.group(0).lower())
 
-    html_remain = str(soup)
-    for m in EMAIL_RE.finditer(html_remain):
+    # Scan the already-owned response string. str(soup) created a second full
+    # HTML copy, which multiplied peak memory during concurrent enrichment.
+    for m in EMAIL_RE.finditer(raw_html):
         candidates.append(m.group(0).lower())
 
     for tag in soup.find_all(True):
@@ -536,6 +555,26 @@ def extract_email_candidates(html: str) -> list[str]:
             seen.add(e)
             unique.append(e)
     return unique
+
+
+def extract_email_candidates(html: str) -> list[str]:
+    """Collect unique emails from one HTML document."""
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        return _email_candidates_from_soup(soup, html)
+    finally:
+        soup.decompose()
+
+
+def extract_page_contacts(html: str) -> tuple[list[str], str | None]:
+    """Extract email candidates and city with one BeautifulSoup parse."""
+    soup = BeautifulSoup(html, "html.parser")
+    try:
+        city = _city_from_soup(soup)
+        emails = _email_candidates_from_soup(soup, html)
+        return emails, city
+    finally:
+        soup.decompose()
 
 
 def http_get_text(session: requests.Session, url: str) -> str | None:
@@ -635,9 +674,10 @@ def scrape_email_for_website(
         pages_read += 1
         # Signals are collected from every page, whether or not it yields an email.
         signals = _merge_signals(signals, detect_signals(html))
-        candidates.extend(extract_email_candidates(html))
+        page_emails, page_city = extract_page_contacts(html)
+        candidates.extend(page_emails)
         if city_found is None:
-            city_found = extract_city_from_html(html)
+            city_found = page_city
         # Only a tier-0 hit (named contact on the business's own domain) is worth
         # stopping for — anything else may still be beaten by a later page.
         best_so_far = pick_best_email(

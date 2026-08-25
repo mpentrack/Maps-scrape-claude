@@ -4,6 +4,7 @@ Run: python app.py  →  http://localhost:5000
 """
 
 import csv
+import gc
 import io
 import logging
 import os
@@ -50,12 +51,12 @@ MAX_RETRIES = 6
 # Keep the defaults deliberately modest for Railway's memory-constrained
 # containers. Every enrichment worker can hold a parsed HTML document, and a
 # scrape worker can hold a Maps search + place-details response.
-JOB_WORKERS = env_int("JOB_WORKERS", 3)
-ENRICH_WORKERS = env_int("ENRICH_WORKERS", 8)
-MX_WORKERS = env_int("MX_WORKERS", 10)
-MAX_QUEUED_JOBS = env_int("MAX_QUEUED_JOBS", 20)
-MAX_ZIPS_PER_JOB = env_int("MAX_ZIPS_PER_JOB", 5000)
-MAX_REQUEST_BYTES = env_int("MAX_REQUEST_BYTES", 262_144)
+JOB_WORKERS = env_int("JOB_WORKERS", 2, maximum=3)
+ENRICH_WORKERS = env_int("ENRICH_WORKERS", 3, maximum=4)
+MX_WORKERS = env_int("MX_WORKERS", 5, maximum=8)
+MAX_QUEUED_JOBS = env_int("MAX_QUEUED_JOBS", 20, maximum=50)
+MAX_ZIPS_PER_JOB = env_int("MAX_ZIPS_PER_JOB", 5000, maximum=5000)
+MAX_REQUEST_BYTES = env_int("MAX_REQUEST_BYTES", 262_144, maximum=1024 * 1024)
 app.config["MAX_CONTENT_LENGTH"] = MAX_REQUEST_BYTES
 APPEND_ZIP_TO_QUERY = os.environ.get("APPEND_ZIP_TO_QUERY", "1").strip().lower() not in ("0", "false", "no", "off")
 # When false (default), do not store info@ / hello@ / etc. if that is all the site exposes.
@@ -105,6 +106,7 @@ _jobs_lock = threading.Lock()
 MAX_JOB_EVENTS  = 200
 MAX_STORED_JOBS = 30
 _job_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUED_JOBS)   # (job_id, api_key) tuples
+_queue_worker_thread: threading.Thread | None = None
 
 # Bulk stage actions run as background jobs on the same worker as scrapes.
 JOB_TYPE_SCRAPE = "scrape"
@@ -113,7 +115,7 @@ JOB_TYPE_BULK_CLEAN = "bulk_clean"
 _BULK_JOB_TYPES = frozenset({JOB_TYPE_BULK_ENRICH, JOB_TYPE_BULK_CLEAN})
 # Rows per commit / progress event. Also the granularity at which a running
 # bulk job notices a cancel request.
-PROGRESS_CHUNK_ROWS = env_int("PROGRESS_CHUNK_ROWS", 100)
+PROGRESS_CHUNK_ROWS = env_int("PROGRESS_CHUNK_ROWS", 50, maximum=100)
 # A capped batch this small finishes well inside an HTTP timeout, so
 # /api/pipeline/advance still answers inline for test-sized runs.
 BULK_INLINE_MAX_ROWS = env_int("BULK_INLINE_MAX_ROWS", 500)
@@ -122,7 +124,7 @@ BULK_INLINE_MAX_ROWS = env_int("BULK_INLINE_MAX_ROWS", 500)
 _details_cache: dict[str, dict | None] = {}
 _details_lock = threading.Lock()
 _DETAIL_COMBO: tuple[str, str] | None = None   # (endpoint, param key) once one works
-MAX_DETAILS_CACHE = env_int("MAX_DETAILS_CACHE", 1000)
+MAX_DETAILS_CACHE = env_int("MAX_DETAILS_CACHE", 250, maximum=500)
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -645,6 +647,11 @@ def _run_job(job_id: str, api_key: str) -> None:
         with _jobs_lock:
             job["completed_at"] = datetime.utcnow().isoformat()
         conn.close()
+        # Place-detail responses are only a speed cache. Drop them between jobs
+        # so queued runs cannot accumulate retained response trees indefinitely.
+        with _details_lock:
+            _details_cache.clear()
+        gc.collect()
 
 
 def _run_bulk_stage_job(job_id: str, job_type: str) -> None:
@@ -837,6 +844,10 @@ def _enrich_stage_rows(
             conn.commit()
             if progress:
                 progress(stats["checked"], total, stats)
+            # BeautifulSoup builds cyclic object graphs. The extractor
+            # decomposes them eagerly; a collection at the batch boundary also
+            # prevents allocator growth over multi-hour production runs.
+            gc.collect()
     return stats
 
 
@@ -1049,20 +1060,18 @@ def index():
 
 @app.route("/health")
 def health():
-    """Cheap Railway health check with non-sensitive queue diagnostics."""
-    conn = get_conn()
-    try:
-        conn.execute("SELECT 1").fetchone()
-    finally:
-        conn.close()
+    """Cheap Railway health check that never waits on the busy SQLite file."""
     with _jobs_lock:
         active = sum(j["status"] in {"queued", "running"} for j in _jobs.values())
-    return jsonify({
-        "ok": True,
+    worker_alive = bool(_queue_worker_thread and _queue_worker_thread.is_alive())
+    response = jsonify({
+        "ok": worker_alive,
+        "worker_alive": worker_alive,
         "active_jobs": active,
         "queue_depth": _job_queue.qsize(),
         "queue_capacity": MAX_QUEUED_JOBS,
     })
+    return response, 200 if worker_alive else 503
 
 
 @app.errorhandler(413)
@@ -1355,19 +1364,30 @@ def export():
     else:
         sql = f"SELECT {select_cols} FROM businesses {where} ORDER BY id DESC"
 
-    conn = get_conn()
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-
     header = columns[:-1] + ["scraped_at_et"]
 
     def generate():
-        buf = io.StringIO()
-        w   = csv.writer(buf)
-        w.writerow(header)
-        for row in rows:
-            w.writerow(list(row))
-        yield buf.getvalue()
+        # Keep only a small cursor batch and CSV chunk in memory. The previous
+        # fetchall() + one giant StringIO could OOM the web process when
+        # exporting the six-figure production table while jobs were active.
+        conn = get_conn()
+        try:
+            cursor = conn.execute(sql, params)
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(header)
+            yield buf.getvalue()
+            while True:
+                rows = cursor.fetchmany(500)
+                if not rows:
+                    break
+                buf.seek(0)
+                buf.truncate(0)
+                for row in rows:
+                    writer.writerow(list(row))
+                yield buf.getvalue()
+        finally:
+            conn.close()
 
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     return Response(
@@ -1517,7 +1537,12 @@ def download_file(filename: str):
 
 if __name__ == "__main__":
     init_db()
-    threading.Thread(target=_queue_worker, daemon=True, name="job-queue-worker").start()
+    _queue_worker_thread = threading.Thread(
+        target=_queue_worker,
+        daemon=True,
+        name="job-queue-worker",
+    )
+    _queue_worker_thread.start()
     app.run(
         host="0.0.0.0",
         port=env_int("PORT", 5000),

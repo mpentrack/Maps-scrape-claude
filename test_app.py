@@ -1,3 +1,4 @@
+import os
 import queue
 import sqlite3
 import tempfile
@@ -143,6 +144,29 @@ class QueueBackpressureTests(unittest.TestCase):
 
 
 class ResponseMemoryLimitTests(unittest.TestCase):
+    def test_env_int_enforces_hard_maximum(self):
+        with mock.patch.dict(os.environ, {"TEST_WORKERS": "99"}):
+            self.assertEqual(
+                email_extract.env_int("TEST_WORKERS", 3, maximum=4),
+                4,
+            )
+
+    def test_page_contacts_share_one_html_parse(self):
+        html = """
+        <html><head>
+          <script type="application/ld+json">
+            {"address": {"addressLocality": "Hartford"}}
+          </script>
+        </head><body><a href="mailto:owner@example.com">Email</a></body></html>
+        """
+        real_parser = email_extract.BeautifulSoup
+        with mock.patch.object(email_extract, "BeautifulSoup", wraps=real_parser) as parser:
+            emails, city = email_extract.extract_page_contacts(html)
+
+        self.assertEqual(parser.call_count, 1)
+        self.assertEqual(emails, ["owner@example.com"])
+        self.assertEqual(city, "Hartford")
+
     def test_http_body_is_streamed_and_truncated_at_configured_limit(self):
         class FakeResponse:
             status_code = 200
@@ -175,6 +199,62 @@ class ResponseMemoryLimitTests(unittest.TestCase):
         self.assertEqual(text, "abcdefghij")
         self.assertTrue(session.kwargs["stream"])
         self.assertTrue(response.closed)
+
+
+class RuntimeHealthAndExportTests(unittest.TestCase):
+    def setUp(self):
+        self.client = app.app.test_client()
+
+    def test_health_tracks_queue_worker_without_touching_database(self):
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        with (
+            mock.patch.object(app, "_queue_worker_thread", worker),
+            mock.patch.object(app, "get_conn", side_effect=AssertionError("health touched SQLite")),
+        ):
+            response = self.client.get("/health")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["worker_alive"])
+
+    def test_export_streams_cursor_batches_without_fetchall(self):
+        columns_per_row = 22
+
+        class FakeCursor:
+            def __init__(self):
+                self.calls = 0
+
+            def fetchmany(self, size):
+                self.calls += 1
+                self.size = size
+                if self.calls == 1:
+                    return [tuple(["value"] * columns_per_row)]
+                return []
+
+            def fetchall(self):
+                raise AssertionError("export used fetchall")
+
+        cursor = FakeCursor()
+
+        class FakeConnection:
+            closed = False
+
+            def execute(self, _sql, _params):
+                return cursor
+
+            def close(self):
+                self.closed = True
+
+        connection = FakeConnection()
+        with mock.patch.object(app, "get_conn", return_value=connection):
+            response = self.client.get("/api/export")
+            body = response.data
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(cursor.size, 500)
+        self.assertGreaterEqual(cursor.calls, 2)
+        self.assertTrue(connection.closed)
+        self.assertIn(b"value", body)
 
 
 if __name__ == "__main__":
