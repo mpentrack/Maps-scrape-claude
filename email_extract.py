@@ -161,6 +161,13 @@ MAX_RESPONSE_BYTES = env_int("MAX_RESPONSE_BYTES", 512 * 1024, maximum=1024 * 10
 MAX_PAGES_PER_DOMAIN = env_int("MAX_PAGES_PER_DOMAIN", 3, maximum=4)
 # Bounds wasted requests on sites where most subpages 404.
 _MAX_FETCH_ATTEMPTS_MULTIPLIER = 3
+# Registrar lookups have no reliable network timeout in python-whois and most
+# modern registrations return privacy proxies anyway. They previously could
+# pin every enrichment worker indefinitely, so website discovery is the safe
+# default. This opt-in exists only for operators willing to accept that risk.
+ENABLE_WHOIS_FALLBACK = os.environ.get("ENABLE_WHOIS_FALLBACK", "0").strip().lower() in (
+    "1", "true", "yes", "on",
+)
 
 
 @dataclass(frozen=True)
@@ -706,7 +713,7 @@ def scrape_email_for_website(
         hostname = urlparse(base).hostname or ""
     except ValueError:
         hostname = ""
-    if hostname:
+    if hostname and ENABLE_WHOIS_FALLBACK:
         w_email = whois_email_for_domain(hostname)
         if w_email and (allow_generic_fallback or not is_generic_email(w_email)):
             with_whois = ",".join(rank_emails(ranked + [w_email], website_url)) or None

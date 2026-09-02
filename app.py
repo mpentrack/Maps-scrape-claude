@@ -6,6 +6,7 @@ Run: python app.py  →  http://localhost:5000
 import csv
 import gc
 import io
+import json
 import logging
 import os
 import queue
@@ -14,6 +15,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from functools import lru_cache
@@ -47,12 +49,13 @@ API_HOST    = "maps-data.p.rapidapi.com"
 API_BASE    = f"https://{API_HOST}"
 PAGE_SIZE   = 20
 MAX_PAGES   = 10
-MAX_RETRIES = 6
+MAX_RETRIES = env_int("MAPS_MAX_RETRIES", 3, maximum=4)
+MAPS_REQUEST_TIMEOUT = env_int("MAPS_REQUEST_TIMEOUT", 15, maximum=30)
 # Keep the defaults deliberately modest for Railway's memory-constrained
 # containers. Every enrichment worker can hold a parsed HTML document, and a
 # scrape worker can hold a Maps search + place-details response.
-JOB_WORKERS = env_int("JOB_WORKERS", 2, maximum=3)
-ENRICH_WORKERS = env_int("ENRICH_WORKERS", 3, maximum=4)
+JOB_WORKERS = env_int("JOB_WORKERS", 3, maximum=3)
+ENRICH_WORKERS = env_int("ENRICH_WORKERS", 5, maximum=6)
 MX_WORKERS = env_int("MX_WORKERS", 5, maximum=8)
 MAX_QUEUED_JOBS = env_int("MAX_QUEUED_JOBS", 20, maximum=50)
 MAX_ZIPS_PER_JOB = env_int("MAX_ZIPS_PER_JOB", 5000, maximum=5000)
@@ -80,6 +83,9 @@ DETAIL_ENDPOINTS = (
     "/place_details.php",
 )
 DETAIL_PARAM_KEYS = ("place_id", "google_id", "cid")
+DETAIL_PROBE_LIMIT = env_int("DETAIL_PROBE_LIMIT", 4, maximum=6)
+DETAIL_REQUEST_TIMEOUT = env_int("DETAIL_REQUEST_TIMEOUT", 8, maximum=15)
+DETAIL_CIRCUIT_SECONDS = env_int("DETAIL_CIRCUIT_SECONDS", 600, minimum=60, maximum=3600)
 
 # Campaign vertical inferred from the search keyword when the caller omits one.
 VERTICAL_MAP = {
@@ -107,6 +113,10 @@ MAX_JOB_EVENTS  = 200
 MAX_STORED_JOBS = 30
 _job_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUED_JOBS)   # (job_id, api_key) tuples
 _queue_worker_thread: threading.Thread | None = None
+_watchdog_thread: threading.Thread | None = None
+_active_job_id: str | None = None
+_worker_progress_monotonic = time.monotonic()
+_job_checkpoint_monotonic: dict[str, float] = {}
 
 # Bulk stage actions run as background jobs on the same worker as scrapes.
 JOB_TYPE_SCRAPE = "scrape"
@@ -124,7 +134,11 @@ BULK_INLINE_MAX_ROWS = env_int("BULK_INLINE_MAX_ROWS", 500)
 _details_cache: dict[str, dict | None] = {}
 _details_lock = threading.Lock()
 _DETAIL_COMBO: tuple[str, str] | None = None   # (endpoint, param key) once one works
+_DETAIL_DISABLED_UNTIL = 0.0
 MAX_DETAILS_CACHE = env_int("MAX_DETAILS_CACHE", 250, maximum=500)
+JOB_STALL_RESTART_SECONDS = env_int(
+    "JOB_STALL_RESTART_SECONDS", 900, minimum=300, maximum=3600
+)
 
 # ── Database ──────────────────────────────────────────────────────────────────
 
@@ -204,6 +218,22 @@ def init_db() -> None:
             cy = resolve_city(None, row["address"], None)
             if cy:
                 conn.execute("UPDATE businesses SET city = ? WHERE id = ?", (cy, row["id"]))
+    # Job state used to live only in process memory. Keep a compact JSON
+    # snapshot on the persistent volume so a Railway restart cannot erase the
+    # queue history or which ZIPs already finished.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS job_runs (
+            id           TEXT PRIMARY KEY,
+            status       TEXT NOT NULL,
+            keyword      TEXT,
+            updated_at   TEXT NOT NULL,
+            payload_json TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_job_runs_updated
+        ON job_runs (updated_at DESC)
+    """)
     conn.commit()
     conn.close()
 
@@ -216,13 +246,22 @@ def _api_get(
     api_key: str,
     *,
     log_context: str = "",
+    max_attempts: int | None = None,
+    request_timeout: int | None = None,
 ) -> dict | list | None:
     headers = {"x-rapidapi-host": API_HOST, "x-rapidapi-key": api_key}
     delay = 1.0
     ctx = f" {log_context}" if log_context else ""
-    for _ in range(MAX_RETRIES):
+    attempts = max_attempts if max_attempts is not None else MAX_RETRIES
+    timeout = request_timeout if request_timeout is not None else MAPS_REQUEST_TIMEOUT
+    for _ in range(attempts):
         try:
-            resp = requests.get(url, headers=headers, params=params, timeout=30)
+            resp = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=timeout,
+            )
             if resp.status_code == 200:
                 try:
                     return resp.json()
@@ -316,20 +355,24 @@ def _fetch_place_details(place_token: str, api_key: str) -> dict | None:
     process, so later lookups cost one API call instead of up to twelve. The cache
     is module-scoped: overlapping ZIPs share it instead of re-probing per ZIP.
     """
-    global _DETAIL_COMBO
+    global _DETAIL_COMBO, _DETAIL_DISABLED_UNTIL
     with _details_lock:
         if place_token in _details_cache:
             return _details_cache[place_token]
+        if time.monotonic() < _DETAIL_DISABLED_UNTIL:
+            return None
         combo = _DETAIL_COMBO
 
     combos = [combo] if combo else [
         (ep, key) for ep in DETAIL_ENDPOINTS for key in DETAIL_PARAM_KEYS
-    ]
+    ][:DETAIL_PROBE_LIMIT]
     payload = None
     for ep, key in combos:
         data = _api_get(
             f"{API_BASE}{ep}", {key: place_token, "language": "en"}, api_key,
             log_context="place-detail",
+            max_attempts=1,
+            request_timeout=DETAIL_REQUEST_TIMEOUT,
         )
         found = _first_dict_payload(data)
         if isinstance(found, dict) and found:
@@ -342,6 +385,14 @@ def _fetch_place_details(place_token: str, api_key: str) -> dict | None:
             break
 
     with _details_lock:
+        if payload is not None:
+            _DETAIL_DISABLED_UNTIL = 0.0
+        else:
+            _DETAIL_DISABLED_UNTIL = time.monotonic() + DETAIL_CIRCUIT_SECONDS
+            log.warning(
+                "Place-details lookup failed; skipping optional detail lookups for %d seconds",
+                DETAIL_CIRCUIT_SECONDS,
+            )
         if len(_details_cache) >= MAX_DETAILS_CACHE:
             for stale in list(_details_cache)[: MAX_DETAILS_CACHE // 2]:
                 del _details_cache[stale]
@@ -407,6 +458,9 @@ def _scrape_zip(
     inserted = skipped = geo_rejected = no_website = 0
     vertical = vertical or vertical_for_keyword(keyword)
     query = _query_for_zip(keyword, zip_code)
+    if job_id:
+        _touch_job(job_id)
+    log.info("[scrape-job %s] zip=%s started query=%r", job_id or "-", zip_code, query)
     coords = us_zip_latlng(zip_code)
     if not coords:
         log.warning(
@@ -494,6 +548,8 @@ def _scrape_zip(
             no_website,
             query,
         )
+        if job_id:
+            _touch_job(job_id)
         if len(results) < PAGE_SIZE:
             break
     log.info(
@@ -555,14 +611,22 @@ def _run_job(job_id: str, api_key: str) -> None:
         _run_bulk_stage_job(job_id, job_type)
         return
     _job_event(job_id, "info", "scrape", "Job started.")
+    _touch_job(job_id)
     with _jobs_lock:
         j = _jobs[job_id]
+        completed_zips = set(j.setdefault("completed_zips", []))
+        requested_zips = j.get("pending_zips")
+        if requested_zips is None:
+            requested_zips = [
+                z for z in (j.get("zip_codes") or []) if z not in completed_zips
+            ]
+        zips_to_run = list(requested_zips)
     log.info(
         "[scrape-job %s] started keyword=%r vertical=%r zip_count=%d mode=%s",
         job_id,
         j.get("keyword"),
         j.get("vertical"),
-        len(j.get("zip_codes") or []),
+        len(zips_to_run),
         j.get("run_mode", "scrape_only"),
     )
 
@@ -578,9 +642,10 @@ def _run_job(job_id: str, api_key: str) -> None:
                     _scrape_zip, z, job["keyword"], api_key, conn, lock, job_id,
                     job.get("vertical"),
                 ): z
-                for z in job["zip_codes"]
+                for z in zips_to_run
             }
             for future in as_completed(futures):
+                zip_code = futures[future]
                 ins, skp, geo, nw = future.result()
                 with _jobs_lock:
                     job["inserted"]           += ins
@@ -588,18 +653,36 @@ def _run_job(job_id: str, api_key: str) -> None:
                     job["geo_rejected"]        = job.get("geo_rejected", 0) + geo
                     job["no_website_prospect"] = job.get("no_website_prospect", 0) + nw
                     job["processed"]          += 1
+                    done = job.setdefault("completed_zips", [])
+                    if zip_code not in done:
+                        done.append(zip_code)
                 _job_event(
                     job_id, "info", "scrape",
                     f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup, {geo} off-target, {nw} no-website).",
                 )
+                _touch_job(job_id)
+        with _jobs_lock:
+            job.pop("pending_zips", None)
         if job.get("run_mode") == "full_pipeline":
             enrich_progress = _stage_progress_reporter(
                 job_id, "enrich", "enriched", _ENRICH_PROGRESS_KEYS, drive_bar=False
             )
             _job_event(job_id, "info", "enrich", "Starting enrichment (in-target scraped rows).")
-            e_scraped = _enrich_stage_rows(conn, "scraped", limit=None, progress=enrich_progress)
+            e_scraped = _enrich_stage_rows(
+                conn,
+                "scraped",
+                limit=None,
+                progress=enrich_progress,
+                heartbeat=lambda: _touch_job(job_id),
+            )
             _job_event(job_id, "info", "enrich", "Starting enrichment (off-target / geo_rejected rows).")
-            e_geo = _enrich_stage_rows(conn, "geo_rejected", limit=None, progress=enrich_progress)
+            e_geo = _enrich_stage_rows(
+                conn,
+                "geo_rejected",
+                limit=None,
+                progress=enrich_progress,
+                heartbeat=lambda: _touch_job(job_id),
+            )
             enriched = {
                 "checked": e_scraped["checked"] + e_geo["checked"],
                 "enriched": e_scraped["enriched"] + e_geo["enriched"],
@@ -646,6 +729,7 @@ def _run_job(job_id: str, api_key: str) -> None:
     finally:
         with _jobs_lock:
             job["completed_at"] = datetime.utcnow().isoformat()
+        _persist_job(job_id)
         conn.close()
         # Place-detail responses are only a speed cache. Drop them between jobs
         # so queued runs cannot accumulate retained response trees indefinitely.
@@ -687,6 +771,7 @@ def _run_bulk_stage_job(job_id: str, job_type: str) -> None:
                 job_id, action, counter_key, keys, drive_bar=True
             ),
             should_cancel=lambda: _cancel_requested(job_id),
+            **({"heartbeat": lambda: _touch_job(job_id)} if action == "enrich" else {}),
         )
         summary = ", ".join(f"{k}={result[k]}" for k in keys if k in result)
         cancelled = bool(result.get("cancelled"))
@@ -718,6 +803,7 @@ def _run_bulk_stage_job(job_id: str, job_type: str) -> None:
     finally:
         with _jobs_lock:
             _jobs[job_id]["completed_at"] = datetime.utcnow().isoformat()
+        _persist_job(job_id)
         conn.close()
 
 
@@ -757,6 +843,7 @@ def _enrich_stage_rows(
     *,
     progress=None,
     should_cancel=None,
+    heartbeat=None,
 ) -> dict:
     """Crawl every candidate row in `from_stage` for an email and ad-tech signals.
 
@@ -841,6 +928,8 @@ def _enrich_stage_rows(
                     stats["errors"] += 1
                     log.warning("Enrichment failed for one row: %s", exc)
                 stats["checked"] += 1
+                if heartbeat:
+                    heartbeat()
             conn.commit()
             if progress:
                 progress(stats["checked"], total, stats)
@@ -979,6 +1068,127 @@ def _clean_stage_rows(
     return stats
 
 
+def _job_snapshot(job: dict) -> dict:
+    """Return a JSON-safe copy of a job; API keys are never part of the job."""
+    return json.loads(json.dumps(job))
+
+
+def _persist_job(job_id: str) -> None:
+    """Upsert one job snapshot into the persistent Railway volume."""
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        snapshot = _job_snapshot(job)
+    updated_at = datetime.utcnow().isoformat()
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                """
+                INSERT INTO job_runs (id, status, keyword, updated_at, payload_json)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    status=excluded.status,
+                    keyword=excluded.keyword,
+                    updated_at=excluded.updated_at,
+                    payload_json=excluded.payload_json
+                """,
+                (
+                    job_id,
+                    snapshot.get("status") or "unknown",
+                    snapshot.get("keyword") or "",
+                    updated_at,
+                    json.dumps(snapshot, separators=(",", ":")),
+                ),
+            )
+            conn.commit()
+    except sqlite3.Error as exc:
+        # Losing one checkpoint must not end the scrape. The next event retries.
+        log.warning("Could not persist job %s checkpoint: %s", job_id, exc)
+
+
+def _delete_persisted_job(job_id: str) -> None:
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+            conn.execute("DELETE FROM job_runs WHERE id = ?", (job_id,))
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.warning("Could not delete rejected job %s checkpoint: %s", job_id, exc)
+
+
+def _restore_jobs_from_db() -> None:
+    """Restore recent history and make pre-restart work explicitly resumable."""
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT payload_json FROM job_runs ORDER BY updated_at DESC LIMIT ?",
+        (MAX_STORED_JOBS,),
+    ).fetchall()
+    conn.close()
+    restored: dict[str, dict] = {}
+    interrupted: list[str] = []
+    now = datetime.utcnow().isoformat()
+    for row in reversed(rows):
+        try:
+            job = json.loads(row["payload_json"])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        job_id = job.get("id")
+        if not job_id:
+            continue
+        if job.get("status") in {"queued", "running"}:
+            previous = job.get("status")
+            job["status"] = "interrupted"
+            job["completed_at"] = now
+            job["error"] = (
+                f"Railway restarted while this job was {previous}. "
+                "Completed ZIPs are saved; use Resume to continue the remainder."
+            )
+            events = job.setdefault("events", [])
+            events.append({
+                "ts": now,
+                "level": "warning",
+                "stage": "job",
+                "message": "Process restart detected; job paused and can be resumed.",
+            })
+            job["events"] = events[-MAX_JOB_EVENTS:]
+            interrupted.append(job_id)
+        restored[job_id] = job
+    with _jobs_lock:
+        _jobs.clear()
+        _jobs.update(restored)
+    for job_id in interrupted:
+        _persist_job(job_id)
+    if restored:
+        log.info(
+            "Restored %d persisted job(s); %d marked interrupted",
+            len(restored),
+            len(interrupted),
+        )
+
+
+def _touch_job(job_id: str) -> None:
+    """Record forward progress for durability and the stall watchdog."""
+    global _worker_progress_monotonic
+    monotonic_now = time.monotonic()
+    now = datetime.utcnow().isoformat()
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return
+        job["heartbeat_at"] = now
+        if _active_job_id == job_id:
+            _worker_progress_monotonic = monotonic_now
+        last_checkpoint = _job_checkpoint_monotonic.get(job_id, 0)
+        should_checkpoint = monotonic_now - last_checkpoint >= 5
+        if should_checkpoint:
+            _job_checkpoint_monotonic[job_id] = monotonic_now
+    # Per-row enrichment heartbeat updates must be cheap. Persist at most once
+    # every five seconds; explicit events still checkpoint immediately.
+    if should_checkpoint:
+        _persist_job(job_id)
+
+
 def _job_event(job_id: str, level: str, stage: str, message: str) -> None:
     with _jobs_lock:
         job = _jobs.get(job_id)
@@ -993,6 +1203,7 @@ def _job_event(job_id: str, level: str, stage: str, message: str) -> None:
         })
         if len(events) > MAX_JOB_EVENTS:
             del events[: len(events) - MAX_JOB_EVENTS]
+    _persist_job(job_id)
 
 
 def _enqueue_job(job: dict, api_key: str, queued_message: str) -> bool:
@@ -1011,6 +1222,7 @@ def _enqueue_job(job: dict, api_key: str, queued_message: str) -> bool:
     except queue.Full:
         with _jobs_lock:
             _jobs.pop(job["id"], None)
+        _delete_persisted_job(job["id"])
         log.warning(
             "Rejected job %s because the queue reached MAX_QUEUED_JOBS=%d",
             job["id"], MAX_QUEUED_JOBS,
@@ -1021,7 +1233,7 @@ def _enqueue_job(job: dict, api_key: str, queued_message: str) -> bool:
 
 def _prune_old_jobs() -> None:
     """Remove oldest terminal jobs from _jobs, keeping at most MAX_STORED_JOBS."""
-    TERMINAL = {"completed", "failed", "cancelled"}
+    TERMINAL = {"completed", "failed", "cancelled", "interrupted"}
     with _jobs_lock:
         terminal = [j for j in _jobs.values() if j["status"] in TERMINAL]
         if len(terminal) <= MAX_STORED_JOBS:
@@ -1029,10 +1241,33 @@ def _prune_old_jobs() -> None:
         terminal.sort(key=lambda j: j.get("started_at") or "")
         for j in terminal[: len(terminal) - MAX_STORED_JOBS]:
             del _jobs[j["id"]]
+            _job_checkpoint_monotonic.pop(j["id"], None)
+
+
+def _job_watchdog() -> None:
+    """Restart a wedged process instead of leaving the queue frozen for hours."""
+    while True:
+        time.sleep(30)
+        job_id = _active_job_id
+        if not job_id:
+            continue
+        stalled_for = time.monotonic() - _worker_progress_monotonic
+        if stalled_for < JOB_STALL_RESTART_SECONDS:
+            continue
+        log.critical(
+            "Job %s made no forward progress for %.0f seconds; exiting so Railway can restart it",
+            job_id,
+            stalled_for,
+        )
+        # The persisted status remains running. Startup converts it to an
+        # interrupted/resumable record before accepting more work.
+        logging.shutdown()
+        os._exit(75)
 
 
 def _queue_worker() -> None:
     """Single consumer thread: runs one job at a time from _job_queue."""
+    global _active_job_id, _worker_progress_monotonic
     while True:
         job_id, api_key = _job_queue.get()
         try:
@@ -1043,10 +1278,13 @@ def _queue_worker() -> None:
             if job.get("status") == "cancelled":
                 _job_event(job_id, "info", "job", "Job was cancelled before it started.")
                 continue
+            _active_job_id = job_id
+            _worker_progress_monotonic = time.monotonic()
             _run_job(job_id, api_key)
         except Exception:
             log.exception("Unexpected error in _queue_worker for job %s", job_id)
         finally:
+            _active_job_id = None
             _job_queue.task_done()
             _prune_old_jobs()
 
@@ -1064,14 +1302,22 @@ def health():
     with _jobs_lock:
         active = sum(j["status"] in {"queued", "running"} for j in _jobs.values())
     worker_alive = bool(_queue_worker_thread and _queue_worker_thread.is_alive())
+    stalled_for = (
+        round(time.monotonic() - _worker_progress_monotonic, 1)
+        if _active_job_id else 0
+    )
+    stalled = bool(_active_job_id and stalled_for >= JOB_STALL_RESTART_SECONDS)
     response = jsonify({
-        "ok": worker_alive,
+        "ok": worker_alive and not stalled,
         "worker_alive": worker_alive,
+        "active_job_id": _active_job_id,
+        "seconds_since_progress": stalled_for,
+        "stalled": stalled,
         "active_jobs": active,
         "queue_depth": _job_queue.qsize(),
         "queue_capacity": MAX_QUEUED_JOBS,
     })
-    return response, 200 if worker_alive else 503
+    return response, 200 if worker_alive and not stalled else 503
 
 
 @app.errorhandler(413)
@@ -1119,6 +1365,78 @@ def cancel_job(job_id: str):
         return jsonify({"ok": True, "pending": True})
     _job_event(job_id, "info", "job", "Job cancelled by user.")
     return jsonify({"ok": True, "pending": False})
+
+
+@app.route("/api/jobs/<job_id>/resume", methods=["POST"])
+def resume_job(job_id: str):
+    """Resume an interrupted job without repeating completed ZIPs."""
+    data = request.get_json(silent=True) or {}
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job:
+            return jsonify({"error": "Job not found"}), 404
+        if job.get("status") != "interrupted":
+            return jsonify({"error": "Only interrupted jobs can be resumed"}), 409
+        job_type = job.get("type", JOB_TYPE_SCRAPE)
+        is_bulk = job_type in _BULK_JOB_TYPES
+    api_key = (data.get("api_key") or "").strip()
+    if not is_bulk and not api_key:
+        return jsonify({"error": "RapidAPI key is required to resume this scrape"}), 400
+
+    now = datetime.utcnow().isoformat()
+    with _jobs_lock:
+        job = _jobs[job_id]
+        previous_error = job.get("error")
+        if is_bulk:
+            # Rows completed before the restart already moved stages, so the
+            # source-stage count is the exact remaining workload.
+            conn = get_conn()
+            try:
+                remaining_count = _count_stage_rows(
+                    conn, job.get("action") or "clean", job.get("from_stage") or "", job.get("limit")
+                )
+            finally:
+                conn.close()
+            job["total"] = remaining_count
+            job["processed"] = 0
+            job["enriched"] = None
+            job["cleaned"] = None
+            remaining_zips = []
+        else:
+            completed = set(job.setdefault("completed_zips", []))
+            remaining_zips = [
+                z for z in (job.get("zip_codes") or []) if z not in completed
+            ]
+            job["pending_zips"] = remaining_zips
+            job["processed"] = len(completed)
+        job["status"] = "queued"
+        job["error"] = None
+        job["completed_at"] = None
+        job["queued_at"] = now
+        job["started_at"] = now
+        job["resume_count"] = int(job.get("resume_count") or 0) + 1
+    try:
+        _job_queue.put_nowait((job_id, api_key))
+    except queue.Full:
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job["status"] = "interrupted"
+            job["error"] = previous_error
+        _persist_job(job_id)
+        response = jsonify({"error": "The job queue is full; try Resume again shortly"})
+        response.headers["Retry-After"] = "30"
+        return response, 429
+    _job_event(
+        job_id,
+        "info",
+        "job",
+        (
+            "Resume queued for the remaining stage rows."
+            if is_bulk else
+            f"Resume queued with {len(remaining_zips)} ZIP(s) remaining; completed ZIPs will not repeat."
+        ),
+    )
+    return jsonify({"ok": True, "id": job_id, "remaining": len(remaining_zips)}), 202
 
 
 @app.route("/api/jobs/<job_id>/events", methods=["GET"])
@@ -1190,6 +1508,7 @@ def start_job():
         "cancel_requested":    False,
         "total":               len(zips),
         "processed":           0,
+        "completed_zips":      [],
         "inserted":            0,
         "duplicates":          0,
         "geo_rejected":        0,
@@ -1197,6 +1516,7 @@ def start_job():
         "queued_at":           datetime.utcnow().isoformat(),
         "started_at":          datetime.utcnow().isoformat(),
         "completed_at":        None,
+        "heartbeat_at":        datetime.utcnow().isoformat(),
         "error":               None,
         "run_mode":            run_mode,
         "enriched":            None,
@@ -1481,6 +1801,7 @@ def advance_pipeline():
         "queued_at":        now,
         "started_at":       now,
         "completed_at":     None,
+        "heartbeat_at":     now,
         "error":            None,
         "run_mode":         job_type,
         "enriched":         None,
@@ -1537,12 +1858,19 @@ def download_file(filename: str):
 
 if __name__ == "__main__":
     init_db()
+    _restore_jobs_from_db()
     _queue_worker_thread = threading.Thread(
         target=_queue_worker,
         daemon=True,
         name="job-queue-worker",
     )
     _queue_worker_thread.start()
+    _watchdog_thread = threading.Thread(
+        target=_job_watchdog,
+        daemon=True,
+        name="job-stall-watchdog",
+    )
+    _watchdog_thread.start()
     app.run(
         host="0.0.0.0",
         port=env_int("PORT", 5000),

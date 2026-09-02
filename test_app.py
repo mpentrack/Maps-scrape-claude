@@ -102,6 +102,10 @@ class StageBatchingTests(unittest.TestCase):
 
 class QueueBackpressureTests(unittest.TestCase):
     def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_db_path = app.DB_PATH
+        app.DB_PATH = str(Path(self.temp_dir.name) / "businesses.db")
+        app.init_db()
         self.original_queue = app._job_queue
         self.original_max = app.MAX_QUEUED_JOBS
         app._job_queue = queue.Queue(maxsize=1)
@@ -115,6 +119,8 @@ class QueueBackpressureTests(unittest.TestCase):
             app._jobs.clear()
         app._job_queue = self.original_queue
         app.MAX_QUEUED_JOBS = self.original_max
+        app.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
 
     def test_full_queue_returns_429_without_retaining_rejected_job(self):
         payload = {
@@ -199,6 +205,140 @@ class ResponseMemoryLimitTests(unittest.TestCase):
         self.assertEqual(text, "abcdefghij")
         self.assertTrue(session.kwargs["stream"])
         self.assertTrue(response.closed)
+
+    def test_whois_fallback_is_disabled_by_default_for_bounded_runtime(self):
+        session = mock.Mock()
+        with (
+            mock.patch.object(email_extract, "ENABLE_WHOIS_FALLBACK", False),
+            mock.patch.object(email_extract, "http_get_text", return_value="<html><body>No email</body></html>"),
+            mock.patch.object(email_extract, "whois_email_for_domain", side_effect=AssertionError("WHOIS ran")),
+        ):
+            result = email_extract.scrape_email_for_website(
+                "https://example.com",
+                session,
+                allow_generic_fallback=False,
+            )
+        self.assertIsNone(result.email)
+
+
+class PersistentJobTests(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_db_path = app.DB_PATH
+        self.original_queue = app._job_queue
+        app.DB_PATH = str(Path(self.temp_dir.name) / "businesses.db")
+        app._job_queue = queue.Queue(maxsize=5)
+        app.init_db()
+        with app._jobs_lock:
+            app._jobs.clear()
+
+    def tearDown(self):
+        with app._jobs_lock:
+            app._jobs.clear()
+        app._job_queue = self.original_queue
+        app.DB_PATH = self.original_db_path
+        self.temp_dir.cleanup()
+
+    def test_restart_preserves_job_and_resume_skips_completed_zips(self):
+        job = {
+            "id": "persist1",
+            "type": app.JOB_TYPE_SCRAPE,
+            "status": "running",
+            "keyword": "plumber",
+            "vertical": "plumbing",
+            "state": "CT",
+            "zip_codes": ["06101", "06103"],
+            "completed_zips": ["06101"],
+            "total": 2,
+            "processed": 1,
+            "inserted": 5,
+            "duplicates": 2,
+            "geo_rejected": 0,
+            "no_website_prospect": 0,
+            "run_mode": "scrape_only",
+            "queued_at": "2026-09-01T12:00:00",
+            "started_at": "2026-09-01T12:00:00",
+            "completed_at": None,
+            "error": None,
+            "events": [],
+        }
+        with app._jobs_lock:
+            app._jobs[job["id"]] = job
+        app._persist_job(job["id"])
+        with app._jobs_lock:
+            app._jobs.clear()
+
+        app._restore_jobs_from_db()
+        with app._jobs_lock:
+            restored = dict(app._jobs[job["id"]])
+        self.assertEqual(restored["status"], "interrupted")
+        self.assertEqual(restored["completed_zips"], ["06101"])
+
+        response = app.app.test_client().post(
+            f"/api/jobs/{job['id']}/resume",
+            json={"api_key": "test-key"},
+        )
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(app._job_queue.get_nowait(), (job["id"], "test-key"))
+        with app._jobs_lock:
+            resumed = dict(app._jobs[job["id"]])
+        self.assertEqual(resumed["status"], "queued")
+        self.assertEqual(resumed["pending_zips"], ["06103"])
+        self.assertEqual(resumed["processed"], 1)
+
+    def test_maps_api_retries_are_bounded(self):
+        with (
+            mock.patch.object(app.requests, "get", side_effect=app.requests.Timeout) as get,
+            mock.patch.object(app.time, "sleep"),
+            mock.patch.object(app, "MAX_RETRIES", 3),
+            mock.patch.object(app, "MAPS_REQUEST_TIMEOUT", 15),
+        ):
+            result = app._api_get("https://example.test", {}, "key")
+        self.assertIsNone(result)
+        self.assertEqual(get.call_count, 3)
+        self.assertTrue(all(call.kwargs["timeout"] == 15 for call in get.call_args_list))
+
+    def test_bulk_completion_timestamp_survives_restart(self):
+        job = {
+            "id": "bulk1",
+            "type": app.JOB_TYPE_BULK_CLEAN,
+            "status": "queued",
+            "keyword": "clean · missing_stage",
+            "from_stage": "missing_stage",
+            "action": "clean",
+            "limit": None,
+            "total": 0,
+            "processed": 0,
+            "cleaned": None,
+            "events": [],
+            "queued_at": "2026-09-01T12:00:00",
+            "started_at": "2026-09-01T12:00:00",
+            "completed_at": None,
+        }
+        with app._jobs_lock:
+            app._jobs[job["id"]] = job
+        app._run_bulk_stage_job(job["id"], app.JOB_TYPE_BULK_CLEAN)
+        with app._jobs_lock:
+            app._jobs.clear()
+        app._restore_jobs_from_db()
+        with app._jobs_lock:
+            restored = dict(app._jobs[job["id"]])
+        self.assertEqual(restored["status"], "completed")
+        self.assertIsNotNone(restored["completed_at"])
+
+    def test_failed_optional_detail_probe_opens_circuit(self):
+        with (
+            mock.patch.object(app, "_DETAIL_COMBO", None),
+            mock.patch.object(app, "_DETAIL_DISABLED_UNTIL", 0.0),
+            mock.patch.object(app, "DETAIL_PROBE_LIMIT", 4),
+            mock.patch.object(app, "DETAIL_CIRCUIT_SECONDS", 600),
+            mock.patch.object(app.time, "monotonic", side_effect=[100.0, 100.0, 101.0]),
+            mock.patch.object(app, "_api_get", return_value=None) as api_get,
+        ):
+            self.assertIsNone(app._fetch_place_details("place-one", "key"))
+            self.assertEqual(api_get.call_count, 4)
+            self.assertIsNone(app._fetch_place_details("place-two", "key"))
+            self.assertEqual(api_get.call_count, 4)
 
 
 class RuntimeHealthAndExportTests(unittest.TestCase):

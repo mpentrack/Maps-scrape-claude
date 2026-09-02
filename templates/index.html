@@ -230,6 +230,7 @@
     .badge-pending   { background: rgba(240,136,62,.15);  color: var(--orange); }
     .badge-queued    { background: rgba(240,136,62,.12);  color: #d29922;       }
     .badge-cancelled { background: rgba(139,148,158,.12); color: var(--muted);  }
+    .badge-interrupted { background: rgba(240,136,62,.15); color: var(--orange); }
     .status-badge {
       font-size: 0.68rem;
       font-weight: 700;
@@ -663,10 +664,12 @@ async function refreshJobs() {
     const color = {
       running:'var(--accent)', completed:'var(--green)', failed:'var(--red)',
       queued:'#d29922', cancelled:'var(--muted)', pending:'var(--orange)',
+      interrupted:'var(--orange)',
     }[j.status] || 'var(--muted)';
     // Bulk stage jobs count rows, not zips, so they get their own counter line.
     const isBulk    = j.type === 'bulk_enrich' || j.type === 'bulk_clean';
     const canCancel = j.status === 'queued' || (j.status === 'running' && isBulk);
+    const canResume = j.status === 'interrupted';
     const n = v => (v == null ? 0 : v).toLocaleString();
     let counters;
     if (isBulk) {
@@ -711,6 +714,10 @@ async function refreshJobs() {
             ${j.run_mode ? `<span class="chip ms-1">${esc(j.run_mode)}</span>` : ''}
           </div>
           <div style="display:flex;align-items:center;gap:6px;flex-shrink:0">
+            ${canResume ? `<button onclick="resumeJob('${esc(j.id)}', ${isBulk})"
+              title="Continue from the last durable checkpoint"
+              style="background:rgba(240,136,62,.12);border:1px solid var(--orange);color:var(--orange);
+                     border-radius:4px;padding:1px 7px;font-size:0.7rem;cursor:pointer;line-height:1.4">Resume</button>` : ''}
             ${canCancel ? `<button onclick="cancelJob('${esc(j.id)}')"
               title="${j.status === 'running' ? 'Stop after the current batch of rows' : 'Cancel queued job'}"
               style="background:transparent;border:1px solid var(--muted);color:var(--muted);
@@ -766,6 +773,35 @@ async function cancelJob(jobId) {
     if (res.ok) await refreshJobs();
     else console.warn('Cancel failed:', (await res.json()).error);
   } catch(e) { console.error('cancelJob error:', e); }
+}
+
+async function resumeJob(jobId, isBulk) {
+  const apiKey = document.getElementById('inp-apikey').value.trim();
+  const errEl = document.getElementById('job-error');
+  errEl.style.display = 'none';
+  if (!isBulk && !apiKey) {
+    errEl.textContent = 'Enter your RapidAPI key above, then click Resume again.';
+    errEl.style.display = '';
+    return;
+  }
+  try {
+    const res = await fetch(`/api/jobs/${jobId}/resume`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({api_key: apiKey}),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      errEl.textContent = data.error || 'Resume failed';
+      errEl.style.display = '';
+      return;
+    }
+    await refreshJobs();
+    ensurePolling();
+  } catch(e) {
+    errEl.textContent = 'Resume failed: ' + e;
+    errEl.style.display = '';
+  }
 }
 
 // ── Stats ──────────────────────────────────────────────────────────────────
