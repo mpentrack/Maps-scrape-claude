@@ -152,7 +152,8 @@ SUBPAGES = [
 PRIORITY_SUBPAGES = ["/contact", "/contact-us", "/about", "/team"]
 
 REQUEST_TIMEOUT = env_int("REQUEST_TIMEOUT", 10, maximum=30)
-MAX_ATTEMPTS = 2
+REQUEST_TOTAL_TIMEOUT = env_int("REQUEST_TOTAL_TIMEOUT", 20, minimum=5, maximum=60)
+MAX_ATTEMPTS = env_int("HTTP_MAX_ATTEMPTS", 1, minimum=1, maximum=2)
 # Never let one unusually large page consume the Railway container. The body is
 # streamed and truncated before decoding/BeautifulSoup parsing, so this is a
 # real memory bound rather than a check performed after the download.
@@ -161,6 +162,7 @@ MAX_RESPONSE_BYTES = env_int("MAX_RESPONSE_BYTES", 512 * 1024, maximum=1024 * 10
 MAX_PAGES_PER_DOMAIN = env_int("MAX_PAGES_PER_DOMAIN", 3, maximum=4)
 # Bounds wasted requests on sites where most subpages 404.
 _MAX_FETCH_ATTEMPTS_MULTIPLIER = 3
+MAX_FETCH_ATTEMPTS = env_int("MAX_FETCH_ATTEMPTS", 6, minimum=4, maximum=9)
 # Registrar lookups have no reliable network timeout in python-whois and most
 # modern registrations return privacy proxies anyway. They previously could
 # pin every enrichment worker indefinitely, so website discovery is the safe
@@ -588,13 +590,17 @@ def http_get_text(session: requests.Session, url: str) -> str | None:
     """GET with retries; None on hard failure. Skips retrying 404."""
     for attempt in range(1, MAX_ATTEMPTS + 1):
         resp = None
+        request_started = time.monotonic()
         try:
             resp = session.get(
                 url,
-                timeout=REQUEST_TIMEOUT,
+                timeout=(min(5, REQUEST_TIMEOUT), REQUEST_TIMEOUT),
                 allow_redirects=True,
                 stream=True,
             )
+            if time.monotonic() - request_started >= REQUEST_TOTAL_TIMEOUT:
+                log.debug("Total request deadline exceeded — %s", url)
+                return None
             if resp.status_code == 404:
                 return None
             if resp.status_code in (429, 503):
@@ -613,6 +619,9 @@ def http_get_text(session: requests.Session, url: str) -> str | None:
             body = bytearray()
             truncated = False
             for chunk in resp.iter_content(chunk_size=64 * 1024):
+                if time.monotonic() - request_started >= REQUEST_TOTAL_TIMEOUT:
+                    log.debug("Streaming deadline exceeded — %s", url)
+                    return None
                 if not chunk:
                     continue
                 remaining = MAX_RESPONSE_BYTES - len(body)
@@ -665,7 +674,7 @@ def scrape_email_for_website(
     attempts = 0
     max_attempts = max(
         len(PRIORITY_SUBPAGES) + 1,
-        MAX_PAGES_PER_DOMAIN * _MAX_FETCH_ATTEMPTS_MULTIPLIER,
+        min(MAX_FETCH_ATTEMPTS, MAX_PAGES_PER_DOMAIN * _MAX_FETCH_ATTEMPTS_MULTIPLIER),
     )
     city_found: str | None = None
     site_host = _site_host_for_match(website_url)

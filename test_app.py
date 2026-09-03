@@ -55,13 +55,83 @@ class StageBatchingTests(unittest.TestCase):
         ]
         self.assertEqual(result["checked"], 105)
         self.assertEqual(result["enriched"], 105)
-        self.assertEqual(progress, [(25, 105), (50, 105), (75, 105), (100, 105), (105, 105)])
-        self.assertEqual(len(batch_selects), 5)
+        self.assertEqual(progress[-1], (105, 105))
+        self.assertEqual(len(batch_selects), 27)
+        self.assertTrue(all(
+            current - previous <= 4
+            for previous, current in zip([0] + [p[0] for p in progress[:-1]], [p[0] for p in progress])
+        ))
         self.assertTrue(all("LIMIT" in sql for sql in batch_selects))
         self.assertEqual(
             conn.execute("SELECT COUNT(*) FROM businesses WHERE pipeline_stage='enriched'").fetchone()[0],
             105,
         )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM businesses WHERE pipeline_stage='enriching'").fetchone()[0],
+            0,
+        )
+        conn.close()
+
+    def test_full_pipeline_enrichment_is_scoped_to_its_source_job(self):
+        conn = app.get_conn()
+        conn.executemany(
+            "INSERT INTO businesses (business_name, website_url, pipeline_stage, source_job_id) "
+            "VALUES (?, ?, 'scraped', ?)",
+            [
+                ("A1", "https://a1.example", "job-a"),
+                ("A2", "https://a2.example", "job-a"),
+                ("B1", "https://b1.example", "job-b"),
+            ],
+        )
+        conn.commit()
+
+        with mock.patch.object(
+            app,
+            "scrape_email_for_website",
+            return_value=EmailScrapeResult("owner@example.com", None),
+        ):
+            result = app._enrich_stage_rows(
+                conn, "scraped", None, source_job_id="job-a"
+            )
+
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) FROM businesses WHERE source_job_id='job-a' AND pipeline_stage='enriched'"
+            ).fetchone()[0],
+            2,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT pipeline_stage FROM businesses WHERE source_job_id='job-b'"
+            ).fetchone()[0],
+            "scraped",
+        )
+        conn.close()
+
+    def test_startup_quarantines_only_rows_left_in_flight(self):
+        conn = app.get_conn()
+        conn.executemany(
+            "INSERT INTO businesses (business_name, website_url, pipeline_stage) VALUES (?, ?, ?)",
+            [
+                ("Stuck", "https://stuck.example", "enriching"),
+                ("Waiting", "https://waiting.example", "scraped"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        app.init_db()
+
+        conn = app.get_conn()
+        stages = {
+            row["business_name"]: (row["pipeline_stage"], row["stage_reason"])
+            for row in conn.execute(
+                "SELECT business_name, pipeline_stage, stage_reason FROM businesses"
+            )
+        }
+        self.assertEqual(stages["Stuck"], ("enrich_failed", "crawl_interrupted"))
+        self.assertEqual(stages["Waiting"][0], "scraped")
         conn.close()
 
     def test_cleaning_selects_only_needed_columns_in_bounded_batches(self):
@@ -206,6 +276,20 @@ class ResponseMemoryLimitTests(unittest.TestCase):
         self.assertTrue(session.kwargs["stream"])
         self.assertTrue(response.closed)
 
+    def test_http_request_has_a_total_wall_clock_deadline(self):
+        response = mock.Mock()
+        response.status_code = 200
+        response.close = mock.Mock()
+        session = mock.Mock()
+        session.get.return_value = response
+        with (
+            mock.patch.object(email_extract.time, "monotonic", side_effect=[10.0, 31.0]),
+            mock.patch.object(email_extract, "REQUEST_TOTAL_TIMEOUT", 20),
+            mock.patch.object(email_extract, "MAX_ATTEMPTS", 1),
+        ):
+            self.assertIsNone(email_extract.http_get_text(session, "https://slow.example"))
+        response.close.assert_called_once()
+
     def test_whois_fallback_is_disabled_by_default_for_bounded_runtime(self):
         session = mock.Mock()
         with (
@@ -285,6 +369,73 @@ class PersistentJobTests(unittest.TestCase):
         self.assertEqual(resumed["status"], "queued")
         self.assertEqual(resumed["pending_zips"], ["06103"])
         self.assertEqual(resumed["processed"], 1)
+
+    def test_restart_automatically_requeues_jobs_with_saved_credentials(self):
+        job = {
+            "id": "auto1",
+            "type": app.JOB_TYPE_SCRAPE,
+            "status": "running",
+            "keyword": "plumber",
+            "zip_codes": ["06101", "06103"],
+            "completed_zips": ["06101"],
+            "total": 2,
+            "processed": 1,
+            "queued_at": "2026-09-01T12:00:00",
+            "started_at": "2026-09-01T12:00:00",
+            "completed_at": None,
+            "events": [],
+        }
+        with app._jobs_lock:
+            app._jobs[job["id"]] = job
+        app._persist_job(job["id"])
+        self.assertTrue(app._store_job_secret(job["id"], "saved-key"))
+        with app._jobs_lock:
+            app._jobs.clear()
+
+        app._restore_jobs_from_db()
+
+        self.assertEqual(app._job_queue.get_nowait(), (job["id"], "saved-key"))
+        with app._jobs_lock:
+            restored = dict(app._jobs[job["id"]])
+        self.assertEqual(restored["status"], "queued")
+        self.assertEqual(restored["pending_zips"], ["06103"])
+        self.assertIsNone(restored["error"])
+
+    def test_legacy_rows_are_attached_only_after_the_job_start(self):
+        conn = app.get_conn()
+        conn.executemany(
+            "INSERT INTO businesses "
+            "(business_name, website_url, pipeline_stage, search_keyword, created_at) "
+            "VALUES (?, ?, 'scraped', 'medical spa', ?)",
+            [
+                ("Old", "https://old.example", "2026-09-03 13:30:00"),
+                ("Current", "https://current.example", "2026-09-03 13:35:00"),
+            ],
+        )
+        conn.commit()
+        claimed = app._claim_legacy_job_rows(conn, {
+            "id": "legacy1",
+            "keyword": "medical spa",
+            "queued_at": "2026-09-03T17:34:33",
+        })
+        self.assertEqual(claimed, 1)
+        rows = conn.execute(
+            "SELECT business_name, source_job_id FROM businesses ORDER BY id"
+        ).fetchall()
+        self.assertIsNone(rows[0]["source_job_id"])
+        self.assertEqual(rows[1]["source_job_id"], "legacy1")
+        conn.close()
+
+    def test_checkpoint_database_wait_is_capped_at_a_quarter_second(self):
+        with app._jobs_lock:
+            app._jobs["quick"] = {"id": "quick", "status": "queued", "keyword": "test"}
+        fake_conn = mock.Mock()
+        with mock.patch.object(app.sqlite3, "connect", return_value=fake_conn) as connect:
+            app._persist_job("quick")
+        self.assertEqual(
+            connect.call_args.kwargs["timeout"],
+            app.JOB_CHECKPOINT_BUSY_TIMEOUT_MS / 1000,
+        )
 
     def test_maps_api_retries_are_bounded(self):
         with (

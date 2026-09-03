@@ -17,7 +17,7 @@ import time
 import uuid
 from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import UTC, datetime
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -137,7 +137,10 @@ _DETAIL_COMBO: tuple[str, str] | None = None   # (endpoint, param key) once one 
 _DETAIL_DISABLED_UNTIL = 0.0
 MAX_DETAILS_CACHE = env_int("MAX_DETAILS_CACHE", 250, maximum=500)
 JOB_STALL_RESTART_SECONDS = env_int(
-    "JOB_STALL_RESTART_SECONDS", 900, minimum=300, maximum=3600
+    "JOB_STALL_RESTART_SECONDS", 300, minimum=180, maximum=1800
+)
+JOB_CHECKPOINT_BUSY_TIMEOUT_MS = env_int(
+    "JOB_CHECKPOINT_BUSY_TIMEOUT_MS", 250, minimum=50, maximum=1000
 )
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -201,6 +204,10 @@ def init_db() -> None:
         "has_ga4": "ALTER TABLE businesses ADD COLUMN has_ga4 INTEGER",
         # Every candidate address, not just the one chosen by pick_best_email().
         "all_emails": "ALTER TABLE businesses ADD COLUMN all_emails TEXT",
+        # Scopes a full-pipeline job to the leads that job actually inserted.
+        # Without this, every queued scrape repeatedly crawled the entire global
+        # backlog before the next scrape could start.
+        "source_job_id": "ALTER TABLE businesses ADD COLUMN source_job_id TEXT",
     }.items():
         if col not in cols:
             conn.execute(ddl)
@@ -209,6 +216,18 @@ def init_db() -> None:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_businesses_stage_id
         ON businesses (pipeline_stage, id)
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_businesses_job_stage_id
+        ON businesses (source_job_id, pipeline_stage, id)
+    """)
+    # A watchdog restart can leave only the small set of currently crawling
+    # rows in this transient state. Quarantine them instead of retrying the
+    # same pathological websites forever and blocking the rest of the queue.
+    conn.execute("""
+        UPDATE businesses
+        SET pipeline_stage='enrich_failed', stage_reason='crawl_interrupted'
+        WHERE pipeline_stage='enriching'
     """)
     conn.execute("UPDATE businesses SET pipeline_stage='scraped' WHERE pipeline_stage IS NULL OR pipeline_stage=''")
     if city_was_new:
@@ -233,6 +252,16 @@ def init_db() -> None:
     conn.execute("""
         CREATE INDEX IF NOT EXISTS idx_job_runs_updated
         ON job_runs (updated_at DESC)
+    """)
+    # Stored separately from the public job JSON. This lets Railway requeue
+    # accepted work after a process restart without exposing RapidAPI keys via
+    # /api/jobs. Secrets are deleted when their job reaches a terminal state.
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS job_secrets (
+            job_id     TEXT PRIMARY KEY,
+            api_key    TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
     """)
     conn.commit()
     conn.close()
@@ -424,6 +453,7 @@ def _insert(
     stage_reason: str | None = None,
     search_keyword: str | None = None,
     vertical: str | None = None,
+    source_job_id: str | None = None,
 ) -> bool:
     phone = row.get("phone") or None
     url   = row.get("website_url") or None
@@ -434,11 +464,11 @@ def _insert(
             conn.execute(
                 "INSERT INTO businesses "
                 "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, "
-                "search_keyword, vertical, pipeline_stage, stage_reason, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "search_keyword, vertical, pipeline_stage, stage_reason, created_at, source_job_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row["business_name"], row["address"], row.get("city"), phone, url,
                  row["rating"], row["review_count"], row["category"], row["zip_code"], row.get("search_zip"),
-                 search_keyword, vertical, pipeline_stage, stage_reason, _now_eastern()),
+                 search_keyword, vertical, pipeline_stage, stage_reason, _now_eastern(), source_job_id),
             )
             conn.commit()
             return True
@@ -522,17 +552,17 @@ def _scrape_zip(
             geo_ok = listing_matches_search_zip(item_for_match, row.get("address"), zip_code)
             accept = exact_ok if strict_exact else geo_ok
             if not accept:
-                if _insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch", keyword, vertical):
+                if _insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch", keyword, vertical, job_id):
                     geo_rejected += 1
                 else:
                     skipped += 1
                 continue
             if not row.get("website_url"):
-                if _insert(conn, lock, row, "no_website_prospect", "no_website", keyword, vertical):
+                if _insert(conn, lock, row, "no_website_prospect", "no_website", keyword, vertical, job_id):
                     no_website += 1
                 else:
                     skipped += 1
-            elif _insert(conn, lock, row, "scraped", None, keyword, vertical):
+            elif _insert(conn, lock, row, "scraped", None, keyword, vertical, job_id):
                 inserted += 1
             else:
                 skipped += 1
@@ -602,6 +632,47 @@ def _stage_progress_reporter(
     return report
 
 
+def _claim_legacy_job_rows(conn: sqlite3.Connection, job: dict) -> int:
+    """Attach rows written just before source_job_id existed to their job.
+
+    Commit 84798b4 persisted the job queue before rows carried a job id. This
+    narrow, time-and-keyword-bounded migration lets the currently interrupted
+    production job finish without sweeping unrelated historical backlog.
+    """
+    job_id = job.get("id")
+    keyword = job.get("keyword")
+    first_queued_at = job.get("first_queued_at") or job.get("queued_at")
+    if not job_id or not keyword or not first_queued_at:
+        return 0
+    already_tagged = conn.execute(
+        "SELECT 1 FROM businesses WHERE source_job_id=? LIMIT 1", (job_id,)
+    ).fetchone()
+    if already_tagged:
+        return 0
+    try:
+        queued = datetime.fromisoformat(first_queued_at)
+        if queued.tzinfo is None:
+            queued = queued.replace(tzinfo=UTC)
+        eastern_start = queued.astimezone(_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError):
+        return 0
+    cursor = conn.execute(
+        """
+        UPDATE businesses
+        SET source_job_id=?
+        WHERE source_job_id IS NULL
+          AND search_keyword=?
+          AND created_at>=?
+          AND pipeline_stage IN ('scraped','geo_rejected','no_website_prospect','enriched','enrich_failed')
+        """,
+        (job_id, keyword, eastern_start),
+    )
+    conn.commit()
+    if cursor.rowcount:
+        log.info("[scrape-job %s] attached %d legacy row(s) to durable job scope", job_id, cursor.rowcount)
+    return cursor.rowcount
+
+
 def _run_job(job_id: str, api_key: str) -> None:
     with _jobs_lock:
         job = _jobs[job_id]
@@ -664,34 +735,28 @@ def _run_job(job_id: str, api_key: str) -> None:
         with _jobs_lock:
             job.pop("pending_zips", None)
         if job.get("run_mode") == "full_pipeline":
+            _claim_legacy_job_rows(conn, job)
             enrich_progress = _stage_progress_reporter(
                 job_id, "enrich", "enriched", _ENRICH_PROGRESS_KEYS, drive_bar=False
             )
-            _job_event(job_id, "info", "enrich", "Starting enrichment (in-target scraped rows).")
+            _job_event(
+                job_id,
+                "info",
+                "enrich",
+                "Starting enrichment for this job's in-target rows. Off-target rows remain saved for optional bulk processing.",
+            )
             e_scraped = _enrich_stage_rows(
                 conn,
                 "scraped",
                 limit=None,
                 progress=enrich_progress,
                 heartbeat=lambda: _touch_job(job_id),
+                source_job_id=job_id,
             )
-            _job_event(job_id, "info", "enrich", "Starting enrichment (off-target / geo_rejected rows).")
-            e_geo = _enrich_stage_rows(
-                conn,
-                "geo_rejected",
-                limit=None,
-                progress=enrich_progress,
-                heartbeat=lambda: _touch_job(job_id),
-            )
-            enriched = {
-                "checked": e_scraped["checked"] + e_geo["checked"],
-                "enriched": e_scraped["enriched"] + e_geo["enriched"],
-                "no_email": e_scraped["no_email"] + e_geo["no_email"],
-            }
+            enriched = dict(e_scraped)
             _job_event(
                 job_id, "info", "enrich",
-                f"Enrichment complete: checked={enriched['checked']}, enriched={enriched['enriched']}, no_email={enriched['no_email']} "
-                f"(scraped {e_scraped['checked']}, geo_rejected {e_geo['checked']}).",
+                f"Enrichment complete: checked={enriched['checked']}, enriched={enriched['enriched']}, no_email={enriched['no_email']}.",
             )
             _job_event(job_id, "info", "clean", "Starting cleaning stage.")
             cleaned = _clean_stage_rows(
@@ -699,6 +764,7 @@ def _run_job(job_id: str, api_key: str) -> None:
                 progress=_stage_progress_reporter(
                     job_id, "clean", "cleaned", _CLEAN_PROGRESS_KEYS, drive_bar=False
                 ),
+                source_job_id=job_id,
             )
             _job_event(
                 job_id, "info", "clean",
@@ -826,12 +892,20 @@ _ENRICH_CANDIDATE_WHERE = (
 
 
 def _count_stage_rows(
-    conn: sqlite3.Connection, action: str, from_stage: str, limit: int | None
+    conn: sqlite3.Connection,
+    action: str,
+    from_stage: str,
+    limit: int | None,
+    source_job_id: str | None = None,
 ) -> int:
     """How many rows a bulk action would touch — used to size the progress bar."""
     where = _ENRICH_CANDIDATE_WHERE if action == "enrich" else "pipeline_stage = ?"
+    params: list[object] = [from_stage]
+    if source_job_id:
+        where += " AND source_job_id = ?"
+        params.append(source_job_id)
     total = conn.execute(
-        f"SELECT COUNT(*) FROM businesses WHERE {where}", (from_stage,)
+        f"SELECT COUNT(*) FROM businesses WHERE {where}", params
     ).fetchone()[0]
     return min(total, limit) if limit else total
 
@@ -844,6 +918,7 @@ def _enrich_stage_rows(
     progress=None,
     should_cancel=None,
     heartbeat=None,
+    source_job_id: str | None = None,
 ) -> dict:
     """Crawl every candidate row in `from_stage` for an email and ad-tech signals.
 
@@ -851,7 +926,7 @@ def _enrich_stage_rows(
     incrementally, reports progress, and can stop between batches. `progress` is
     called as progress(done, total, stats) after each batch.
     """
-    total = _count_stage_rows(conn, "enrich", from_stage, limit)
+    total = _count_stage_rows(conn, "enrich", from_stage, limit, source_job_id)
     stats = {"checked": 0, "enriched": 0, "no_email": 0, "errors": 0, "cancelled": False}
     if not total:
         if progress:
@@ -883,21 +958,40 @@ def _enrich_stage_rows(
             if should_cancel and should_cancel():
                 stats["cancelled"] = True
                 break
-            batch_size = min(PROGRESS_CHUNK_ROWS, total - stats["checked"])
+            # Only keep one worker-width of websites in flight. If every
+            # website in a group wedges below Requests' socket layer, the
+            # watchdog restarts the process and startup quarantines at most
+            # ENRICH_WORKERS rows instead of replaying a 200-row batch forever.
+            batch_size = min(PROGRESS_CHUNK_ROWS, ENRICH_WORKERS, total - stats["checked"])
+            where = _ENRICH_CANDIDATE_WHERE
+            params: list[object] = [from_stage]
+            if source_job_id:
+                where += " AND source_job_id = ?"
+                params.append(source_job_id)
             batch = conn.execute(
                 f"SELECT id, website_url FROM businesses "
-                f"WHERE {_ENRICH_CANDIDATE_WHERE} AND id > ? "
+                f"WHERE {where} AND id > ? "
                 "ORDER BY id ASC LIMIT ?",
-                (from_stage, last_id, batch_size),
+                (*params, last_id, batch_size),
             ).fetchall()
             if not batch:
                 break
             last_id = batch[-1]["id"]
-            futures = [pool.submit(task, row) for row in batch]
+            row_ids = [row["id"] for row in batch]
+            placeholders = ",".join("?" for _ in row_ids)
+            conn.execute(
+                f"UPDATE businesses SET pipeline_stage='enriching', stage_reason='crawl_in_progress' "
+                f"WHERE id IN ({placeholders})",
+                row_ids,
+            )
+            conn.commit()
+            futures = {pool.submit(task, row): row["id"] for row in batch}
             for fut in as_completed(futures):
                 # One unreachable site must never end a 45k-row run, so every
-                # row is accounted for individually. Rows that raise keep their
-                # current stage and are picked up by the next run.
+                # row is accounted for individually. A row that raises is
+                # quarantined so a pathological domain cannot block every
+                # later queued job on each retry.
+                row_id = futures[fut]
                 try:
                     row_id, res = fut.result()
                     now = datetime.utcnow().isoformat()
@@ -926,11 +1020,18 @@ def _enrich_stage_rows(
                         )
                 except Exception as exc:
                     stats["errors"] += 1
+                    conn.execute(
+                        "UPDATE businesses SET pipeline_stage='enrich_failed', "
+                        "stage_reason='crawl_error', enriched_at=? WHERE id=?",
+                        (datetime.utcnow().isoformat(), row_id),
+                    )
                     log.warning("Enrichment failed for one row: %s", exc)
                 stats["checked"] += 1
+                # Release SQLite's writer lock before the durable job heartbeat
+                # opens its own short-lived connection.
+                conn.commit()
                 if heartbeat:
                     heartbeat()
-            conn.commit()
             if progress:
                 progress(stats["checked"], total, stats)
             # BeautifulSoup builds cyclic object graphs. The extractor
@@ -1016,6 +1117,7 @@ def _clean_stage_rows(
     *,
     progress=None,
     should_cancel=None,
+    source_job_id: str | None = None,
 ) -> dict:
     """Classify every row in `from_stage` as clean / flagged / clean_failed.
 
@@ -1023,7 +1125,7 @@ def _clean_stage_rows(
     cached, so the total work is unchanged) rather than all up front, which keeps
     progress moving instead of stalling on tens of thousands of DNS lookups.
     """
-    total = _count_stage_rows(conn, "clean", from_stage, limit)
+    total = _count_stage_rows(conn, "clean", from_stage, limit, source_job_id)
     stats = {"checked": 0, "clean": 0, "flagged": 0, "failed": 0, "cancelled": False}
     if not total:
         if progress:
@@ -1040,10 +1142,15 @@ def _clean_stage_rows(
         # Cleaning only reads these three columns. Selecting every column for
         # an entire archived stage retained large address/email/signal strings
         # that the classifier never uses.
+        where = "pipeline_stage = ?"
+        params: list[object] = [from_stage]
+        if source_job_id:
+            where += " AND source_job_id = ?"
+            params.append(source_job_id)
         batch = conn.execute(
             "SELECT id, business_name, email FROM businesses "
-            "WHERE pipeline_stage = ? AND id > ? ORDER BY id ASC LIMIT ?",
-            (from_stage, last_id, batch_size),
+            f"WHERE {where} AND id > ? ORDER BY id ASC LIMIT ?",
+            (*params, last_id, batch_size),
         ).fetchall()
         if not batch:
             break
@@ -1082,8 +1189,9 @@ def _persist_job(job_id: str) -> None:
         snapshot = _job_snapshot(job)
     updated_at = datetime.utcnow().isoformat()
     try:
-        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
-            conn.execute("PRAGMA busy_timeout=5000")
+        timeout_seconds = JOB_CHECKPOINT_BUSY_TIMEOUT_MS / 1000
+        with closing(sqlite3.connect(DB_PATH, timeout=timeout_seconds)) as conn:
+            conn.execute(f"PRAGMA busy_timeout={JOB_CHECKPOINT_BUSY_TIMEOUT_MS}")
             conn.execute(
                 """
                 INSERT INTO job_runs (id, status, keyword, updated_at, payload_json)
@@ -1117,16 +1225,54 @@ def _delete_persisted_job(job_id: str) -> None:
         log.warning("Could not delete rejected job %s checkpoint: %s", job_id, exc)
 
 
+def _store_job_secret(job_id: str, api_key: str) -> bool:
+    """Persist a scrape credential without ever adding it to public job JSON."""
+    if not api_key:
+        return True
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(
+                """
+                INSERT INTO job_secrets (job_id, api_key, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    api_key=excluded.api_key,
+                    updated_at=excluded.updated_at
+                """,
+                (job_id, api_key, datetime.utcnow().isoformat()),
+            )
+            conn.commit()
+        return True
+    except sqlite3.Error as exc:
+        log.error("Could not persist recovery credential for job %s: %s", job_id, exc)
+        return False
+
+
+def _delete_job_secret(job_id: str) -> None:
+    try:
+        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+            conn.execute("DELETE FROM job_secrets WHERE job_id=?", (job_id,))
+            conn.commit()
+    except sqlite3.Error as exc:
+        log.warning("Could not delete recovery credential for job %s: %s", job_id, exc)
+
+
 def _restore_jobs_from_db() -> None:
-    """Restore recent history and make pre-restart work explicitly resumable."""
+    """Restore history and automatically requeue jobs with recovery credentials."""
     conn = get_conn()
     rows = conn.execute(
         "SELECT payload_json FROM job_runs ORDER BY updated_at DESC LIMIT ?",
         (MAX_STORED_JOBS,),
     ).fetchall()
+    secrets = {
+        row["job_id"]: row["api_key"]
+        for row in conn.execute("SELECT job_id, api_key FROM job_secrets")
+    }
     conn.close()
     restored: dict[str, dict] = {}
     interrupted: list[str] = []
+    auto_requeue: list[tuple[str, str]] = []
     now = datetime.utcnow().isoformat()
     for row in reversed(rows):
         try:
@@ -1138,31 +1284,75 @@ def _restore_jobs_from_db() -> None:
             continue
         if job.get("status") in {"queued", "running"}:
             previous = job.get("status")
-            job["status"] = "interrupted"
-            job["completed_at"] = now
-            job["error"] = (
-                f"Railway restarted while this job was {previous}. "
-                "Completed ZIPs are saved; use Resume to continue the remainder."
-            )
             events = job.setdefault("events", [])
-            events.append({
-                "ts": now,
-                "level": "warning",
-                "stage": "job",
-                "message": "Process restart detected; job paused and can be resumed.",
-            })
+            is_bulk = job.get("type") in _BULK_JOB_TYPES
+            api_key = "" if is_bulk else secrets.get(job_id, "")
+            if is_bulk or api_key:
+                completed = set(job.setdefault("completed_zips", []))
+                if not is_bulk:
+                    job["pending_zips"] = [
+                        z for z in (job.get("zip_codes") or []) if z not in completed
+                    ]
+                    job["processed"] = len(completed)
+                job["status"] = "queued"
+                job["completed_at"] = None
+                job["error"] = None
+                events.append({
+                    "ts": now,
+                    "level": "warning",
+                    "stage": "job",
+                    "message": (
+                        f"Process restart detected while {previous}; automatically requeued from the durable checkpoint."
+                    ),
+                })
+                auto_requeue.append((job_id, api_key))
+            else:
+                job["status"] = "interrupted"
+                job["completed_at"] = now
+                job["error"] = (
+                    f"Railway restarted while this job was {previous}. "
+                    "Completed ZIPs are saved; use Resume to continue the remainder."
+                )
+                events.append({
+                    "ts": now,
+                    "level": "warning",
+                    "stage": "job",
+                    "message": "Process restart detected; job paused and can be resumed.",
+                })
+                interrupted.append(job_id)
             job["events"] = events[-MAX_JOB_EVENTS:]
-            interrupted.append(job_id)
         restored[job_id] = job
     with _jobs_lock:
         _jobs.clear()
         _jobs.update(restored)
-    for job_id in interrupted:
+    for job_id in interrupted + [job_id for job_id, _ in auto_requeue]:
         _persist_job(job_id)
+    queued_count = 0
+    auto_requeue.sort(key=lambda item: restored[item[0]].get("first_queued_at") or restored[item[0]].get("queued_at") or "")
+    for job_id, api_key in auto_requeue:
+        try:
+            _job_queue.put_nowait((job_id, api_key))
+            queued_count += 1
+        except queue.Full:
+            with _jobs_lock:
+                job = _jobs[job_id]
+                job["status"] = "interrupted"
+                job["completed_at"] = now
+                job["error"] = "Recovery queue is full; use Resume when capacity is available."
+            _persist_job(job_id)
+            interrupted.append(job_id)
+    recoverable_ids = {
+        job_id
+        for job_id, job in restored.items()
+        if job.get("status") in {"queued", "running", "interrupted"}
+    }
+    for stale_secret_id in set(secrets) - recoverable_ids:
+        _delete_job_secret(stale_secret_id)
     if restored:
         log.info(
-            "Restored %d persisted job(s); %d marked interrupted",
+            "Restored %d persisted job(s); %d automatically requeued; %d require manual resume",
             len(restored),
+            queued_count,
             len(interrupted),
         )
 
@@ -1217,11 +1407,17 @@ def _enqueue_job(job: dict, api_key: str, queued_message: str) -> bool:
     with _jobs_lock:
         _jobs[job["id"]] = job
     _job_event(job["id"], "info", "job", queued_message)
+    if api_key and not _store_job_secret(job["id"], api_key):
+        with _jobs_lock:
+            _jobs.pop(job["id"], None)
+        _delete_persisted_job(job["id"])
+        return False
     try:
         _job_queue.put_nowait((job["id"], api_key))
     except queue.Full:
         with _jobs_lock:
             _jobs.pop(job["id"], None)
+        _delete_job_secret(job["id"])
         _delete_persisted_job(job["id"])
         log.warning(
             "Rejected job %s because the queue reached MAX_QUEUED_JOBS=%d",
@@ -1286,6 +1482,10 @@ def _queue_worker() -> None:
         finally:
             _active_job_id = None
             _job_queue.task_done()
+            with _jobs_lock:
+                final_status = (_jobs.get(job_id) or {}).get("status")
+            if final_status in {"completed", "failed", "cancelled"}:
+                _delete_job_secret(job_id)
             _prune_old_jobs()
 
 
@@ -1364,6 +1564,7 @@ def cancel_job(job_id: str):
         _job_event(job_id, "info", "job", "Cancel requested — stopping after the current batch.")
         return jsonify({"ok": True, "pending": True})
     _job_event(job_id, "info", "job", "Job cancelled by user.")
+    _delete_job_secret(job_id)
     return jsonify({"ok": True, "pending": False})
 
 
@@ -1387,6 +1588,8 @@ def resume_job(job_id: str):
     with _jobs_lock:
         job = _jobs[job_id]
         previous_error = job.get("error")
+        job.setdefault("first_queued_at", job.get("queued_at"))
+        job["last_interrupted_at"] = job.get("completed_at")
         if is_bulk:
             # Rows completed before the restart already moved stages, so the
             # source-stage count is the exact remaining workload.
@@ -1415,6 +1618,13 @@ def resume_job(job_id: str):
         job["queued_at"] = now
         job["started_at"] = now
         job["resume_count"] = int(job.get("resume_count") or 0) + 1
+    if api_key and not _store_job_secret(job_id, api_key):
+        with _jobs_lock:
+            job = _jobs[job_id]
+            job["status"] = "interrupted"
+            job["error"] = previous_error
+        _persist_job(job_id)
+        return jsonify({"error": "Could not save the recovery credential; try Resume again"}), 503
     try:
         _job_queue.put_nowait((job_id, api_key))
     except queue.Full:
@@ -1422,6 +1632,7 @@ def resume_job(job_id: str):
             job = _jobs[job_id]
             job["status"] = "interrupted"
             job["error"] = previous_error
+        _delete_job_secret(job_id)
         _persist_job(job_id)
         response = jsonify({"error": "The job queue is full; try Resume again shortly"})
         response.headers["Retry-After"] = "30"
@@ -1514,6 +1725,7 @@ def start_job():
         "geo_rejected":        0,
         "no_website_prospect": 0,
         "queued_at":           datetime.utcnow().isoformat(),
+        "first_queued_at":     datetime.utcnow().isoformat(),
         "started_at":          datetime.utcnow().isoformat(),
         "completed_at":        None,
         "heartbeat_at":        datetime.utcnow().isoformat(),
@@ -1799,6 +2011,7 @@ def advance_pipeline():
         "inserted":         0,
         "duplicates":       0,
         "queued_at":        now,
+        "first_queued_at":  now,
         "started_at":       now,
         "completed_at":     None,
         "heartbeat_at":     now,

@@ -589,6 +589,7 @@ let currentPage  = 1;
 let totalPages   = 1;
 let pollTimer    = null;
 let leadTimer    = null;
+let latestJobs   = [];
 const expandedJobLogs = new Set();
 
 // ── Zip-tab switching ──────────────────────────────────────────────────────
@@ -648,6 +649,7 @@ function ensurePolling() {
 async function refreshJobs() {
   const res  = await fetch('/api/jobs');
   const jobs = await res.json();
+  latestJobs = jobs;
 
   document.getElementById('job-count').textContent =
     jobs.length + ' job' + (jobs.length !== 1 ? 's' : '');
@@ -659,7 +661,19 @@ async function refreshJobs() {
     return;
   }
 
-  el.innerHTML = jobs.map(j => {
+  const interruptedCount = jobs.filter(j => j.status === 'interrupted').length;
+  const resumeAll = interruptedCount > 1 ? `
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:12px;
+                margin-bottom:10px;padding:8px 10px;border:1px solid rgba(240,136,62,.35);
+                border-radius:6px;background:rgba(240,136,62,.08)">
+      <span style="font-size:.76rem;color:var(--orange)">${interruptedCount} jobs recovered from the restart</span>
+      <button id="btn-resume-all" class="btn-ghost" onclick="resumeAllJobs()"
+              style="border-color:var(--orange);color:var(--orange);padding:3px 9px;font-size:.72rem">
+        Resume all
+      </button>
+    </div>` : '';
+
+  el.innerHTML = resumeAll + jobs.map(j => {
     const pct   = j.total ? Math.round((j.processed / j.total) * 100) : 0;
     const color = {
       running:'var(--accent)', completed:'var(--green)', failed:'var(--red)',
@@ -800,6 +814,47 @@ async function resumeJob(jobId, isBulk) {
     ensurePolling();
   } catch(e) {
     errEl.textContent = 'Resume failed: ' + e;
+    errEl.style.display = '';
+  }
+}
+
+async function resumeAllJobs() {
+  const apiKey = document.getElementById('inp-apikey').value.trim();
+  const errEl = document.getElementById('job-error');
+  const jobs = latestJobs
+    .filter(j => j.status === 'interrupted')
+    .sort((a, b) => (a.first_queued_at || a.queued_at || '').localeCompare(b.first_queued_at || b.queued_at || ''));
+  if (jobs.some(j => j.type === 'scrape') && !apiKey) {
+    errEl.textContent = 'Enter your RapidAPI key above, then click Resume all again.';
+    errEl.style.display = '';
+    return;
+  }
+  const btn = document.getElementById('btn-resume-all');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Resuming…';
+  }
+  errEl.style.display = 'none';
+  let resumed = 0;
+  const failures = [];
+  for (const job of jobs) {
+    try {
+      const res = await fetch(`/api/jobs/${job.id}/resume`, {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({api_key: apiKey}),
+      });
+      const data = await res.json();
+      if (res.ok) resumed += 1;
+      else failures.push(`${job.keyword}: ${data.error || 'resume failed'}`);
+    } catch (e) {
+      failures.push(`${job.keyword}: ${e}`);
+    }
+  }
+  await refreshJobs();
+  if (resumed) ensurePolling();
+  if (failures.length) {
+    errEl.textContent = `${resumed} resumed; ${failures.join(' | ')}`;
     errEl.style.display = '';
   }
 }
