@@ -4,6 +4,7 @@ Run: python app.py  →  http://localhost:5000
 """
 
 import csv
+import ctypes
 import gc
 import io
 import json
@@ -109,6 +110,10 @@ def vertical_for_keyword(keyword: str) -> str:
 # ── In-memory job store ───────────────────────────────────────────────────────
 _jobs: dict[str, dict] = {}
 _jobs_lock = threading.Lock()
+# SQLite permits many readers but only one writer.  Every write in this process
+# shares this lock so the scrape workers, job checkpointing, and HTTP routes do
+# not race each other for the volume's single SQLite writer slot.
+_db_write_lock = threading.RLock()
 MAX_JOB_EVENTS  = 200
 MAX_STORED_JOBS = 30
 _job_queue: queue.Queue = queue.Queue(maxsize=MAX_QUEUED_JOBS)   # (job_id, api_key) tuples
@@ -148,7 +153,46 @@ JOB_CHECKPOINT_BUSY_TIMEOUT_MS = env_int(
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
+
+
+def _rss_mb() -> float | None:
+    """Return current resident memory on Railway/Linux when available."""
+    try:
+        with open("/proc/self/statm", encoding="ascii") as statm:
+            resident_pages = int(statm.read().split()[1])
+        return resident_pages * os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _release_process_memory(context: str) -> None:
+    """Collect parser cycles and return free glibc heap pages to Railway."""
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = libc.malloc_trim
+        malloc_trim.argtypes = [ctypes.c_size_t]
+        malloc_trim.restype = ctypes.c_int
+        malloc_trim(0)
+    except (OSError, AttributeError):
+        # macOS and non-glibc development environments do not expose
+        # malloc_trim; cyclic collection above still remains effective.
+        pass
+    rss = _rss_mb()
+    if rss is not None:
+        log.info("Memory after %s: %.1f MB RSS", context, rss)
+
+
+def _clear_details_cache(context: str) -> None:
+    """Drop Maps response trees as soon as their pipeline phase is finished."""
+    with _details_lock:
+        cached = len(_details_cache)
+        _details_cache.clear()
+    _release_process_memory(context)
+    if cached:
+        log.info("Released %d cached place-detail response(s)", cached)
 
 
 def init_db() -> None:
@@ -459,7 +503,7 @@ def _insert(
     url   = row.get("website_url") or None
     if phone is None and url is None:
         return False
-    with lock:
+    with lock, _db_write_lock:
         try:
             conn.execute(
                 "INSERT INTO businesses "
@@ -656,18 +700,19 @@ def _claim_legacy_job_rows(conn: sqlite3.Connection, job: dict) -> int:
         eastern_start = queued.astimezone(_EASTERN).strftime("%Y-%m-%d %H:%M:%S")
     except (TypeError, ValueError):
         return 0
-    cursor = conn.execute(
-        """
-        UPDATE businesses
-        SET source_job_id=?
-        WHERE source_job_id IS NULL
-          AND search_keyword=?
-          AND created_at>=?
-          AND pipeline_stage IN ('scraped','geo_rejected','no_website_prospect','enriched','enrich_failed')
-        """,
-        (job_id, keyword, eastern_start),
-    )
-    conn.commit()
+    with _db_write_lock:
+        cursor = conn.execute(
+            """
+            UPDATE businesses
+            SET source_job_id=?
+            WHERE source_job_id IS NULL
+              AND search_keyword=?
+              AND created_at>=?
+              AND pipeline_stage IN ('scraped','geo_rejected','no_website_prospect','enriched','enrich_failed')
+            """,
+            (job_id, keyword, eastern_start),
+        )
+        conn.commit()
     if cursor.rowcount:
         log.info("[scrape-job %s] attached %d legacy row(s) to durable job scope", job_id, cursor.rowcount)
     return cursor.rowcount
@@ -701,8 +746,7 @@ def _run_job(job_id: str, api_key: str) -> None:
         j.get("run_mode", "scrape_only"),
     )
 
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = get_conn()
     conn.execute("PRAGMA journal_mode=WAL")
     lock = threading.Lock()
 
@@ -732,6 +776,10 @@ def _run_job(job_id: str, api_key: str) -> None:
                     f"Processed zip {job['processed']}/{job['total']} (+{ins} new, {skp} dup, {geo} off-target, {nw} no-website).",
                 )
                 _touch_job(job_id)
+        # Enrichment never consults Maps place-detail responses.  Keeping these
+        # potentially large JSON trees alive through that phase made every
+        # full-pipeline run start near Railway's memory ceiling.
+        _clear_details_cache("scrape phase")
         with _jobs_lock:
             job.pop("pending_zips", None)
         if job.get("run_mode") == "full_pipeline":
@@ -797,11 +845,8 @@ def _run_job(job_id: str, api_key: str) -> None:
             job["completed_at"] = datetime.utcnow().isoformat()
         _persist_job(job_id)
         conn.close()
-        # Place-detail responses are only a speed cache. Drop them between jobs
-        # so queued runs cannot accumulate retained response trees indefinitely.
-        with _details_lock:
-            _details_cache.clear()
-        gc.collect()
+        # Also clear on failures and scrape-only runs.
+        _clear_details_cache("job cleanup")
 
 
 def _run_bulk_stage_job(job_id: str, job_type: str) -> None:
@@ -823,8 +868,7 @@ def _run_bulk_stage_job(job_id: str, job_type: str) -> None:
     _job_event(job_id, "info", action, f"Bulk {action} started on stage '{from_stage}' ({scope}).")
     log.info("[bulk-%s job %s] started stage=%s limit=%s", action, job_id, from_stage, limit)
 
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
+    conn = get_conn()
     conn.execute("PRAGMA journal_mode=WAL")
 
     try:
@@ -979,12 +1023,13 @@ def _enrich_stage_rows(
             last_id = batch[-1]["id"]
             row_ids = [row["id"] for row in batch]
             placeholders = ",".join("?" for _ in row_ids)
-            conn.execute(
-                f"UPDATE businesses SET pipeline_stage='enriching', stage_reason='crawl_in_progress' "
-                f"WHERE id IN ({placeholders})",
-                row_ids,
-            )
-            conn.commit()
+            with _db_write_lock:
+                conn.execute(
+                    f"UPDATE businesses SET pipeline_stage='enriching', stage_reason='crawl_in_progress' "
+                    f"WHERE id IN ({placeholders})",
+                    row_ids,
+                )
+                conn.commit()
             futures = {pool.submit(task, row): row["id"] for row in batch}
             for fut in as_completed(futures):
                 # One unreachable site must never end a 45k-row run, so every
@@ -992,44 +1037,45 @@ def _enrich_stage_rows(
                 # quarantined so a pathological domain cannot block every
                 # later queued job on each retry.
                 row_id = futures[fut]
-                try:
-                    row_id, res = fut.result()
-                    now = datetime.utcnow().isoformat()
-                    sig = _signal_columns(res.signals)
-                    if res.email:
+                with _db_write_lock:
+                    try:
+                        row_id, res = fut.result()
+                        now = datetime.utcnow().isoformat()
+                        sig = _signal_columns(res.signals)
+                        if res.email:
+                            conn.execute(
+                                "UPDATE businesses SET email=?, all_emails=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=?, "
+                                "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
+                                (res.email, res.all_emails, now, *sig, row_id),
+                            )
+                            stats["enriched"] += 1
+                        else:
+                            reason = res.stage_reason or "no_email_found"
+                            # Signals are written here too: a business running ads with no
+                            # discoverable email is still worth knowing about.
+                            conn.execute(
+                                "UPDATE businesses SET all_emails=?, pipeline_stage='enrich_failed', stage_reason=?, enriched_at=?, "
+                                "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
+                                (res.all_emails, reason, now, *sig, row_id),
+                            )
+                            stats["no_email"] += 1
+                        if res.city:
+                            conn.execute(
+                                "UPDATE businesses SET city=? WHERE id=? AND (city IS NULL OR TRIM(city)='')",
+                                (res.city, row_id),
+                            )
+                    except Exception as exc:
+                        stats["errors"] += 1
                         conn.execute(
-                            "UPDATE businesses SET email=?, all_emails=?, pipeline_stage='enriched', stage_reason=NULL, enriched_at=?, "
-                            "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
-                            (res.email, res.all_emails, now, *sig, row_id),
+                            "UPDATE businesses SET pipeline_stage='enrich_failed', "
+                            "stage_reason='crawl_error', enriched_at=? WHERE id=?",
+                            (datetime.utcnow().isoformat(), row_id),
                         )
-                        stats["enriched"] += 1
-                    else:
-                        reason = res.stage_reason or "no_email_found"
-                        # Signals are written here too: a business running ads with no
-                        # discoverable email is still worth knowing about.
-                        conn.execute(
-                            "UPDATE businesses SET all_emails=?, pipeline_stage='enrich_failed', stage_reason=?, enriched_at=?, "
-                            "runs_google_ads=?, aw_ids=?, call_tracking=?, has_gtm=?, has_ga4=? WHERE id=?",
-                            (res.all_emails, reason, now, *sig, row_id),
-                        )
-                        stats["no_email"] += 1
-                    if res.city:
-                        conn.execute(
-                            "UPDATE businesses SET city=? WHERE id=? AND (city IS NULL OR TRIM(city)='')",
-                            (res.city, row_id),
-                        )
-                except Exception as exc:
-                    stats["errors"] += 1
-                    conn.execute(
-                        "UPDATE businesses SET pipeline_stage='enrich_failed', "
-                        "stage_reason='crawl_error', enriched_at=? WHERE id=?",
-                        (datetime.utcnow().isoformat(), row_id),
-                    )
-                    log.warning("Enrichment failed for one row: %s", exc)
-                stats["checked"] += 1
-                # Release SQLite's writer lock before the durable job heartbeat
-                # opens its own short-lived connection.
-                conn.commit()
+                        log.warning("Enrichment failed for one row: %s", exc)
+                    stats["checked"] += 1
+                    # Release SQLite's writer lock before the durable job heartbeat
+                    # opens its own short-lived connection.
+                    conn.commit()
                 if heartbeat:
                     heartbeat()
             if progress:
@@ -1038,6 +1084,8 @@ def _enrich_stage_rows(
             # decomposes them eagerly; a collection at the batch boundary also
             # prevents allocator growth over multi-hour production runs.
             gc.collect()
+            if stats["checked"] % 25 == 0 or stats["checked"] == total:
+                _release_process_memory(f"enrichment {stats['checked']}/{total}")
     return stats
 
 
@@ -1156,20 +1204,21 @@ def _clean_stage_rows(
             break
         last_id = batch[-1]["id"]
         _warm_mx_cache(batch)
-        for row in batch:
-            stage, reason = _classify_clean_stage(row)
-            conn.execute(
-                "UPDATE businesses SET pipeline_stage=?, stage_reason=?, cleaned_at=? WHERE id=?",
-                (stage, reason, now, row["id"]),
-            )
-            if stage == "clean":
-                stats["clean"] += 1
-            elif stage == "flagged":
-                stats["flagged"] += 1
-            else:
-                stats["failed"] += 1
-            stats["checked"] += 1
-        conn.commit()
+        with _db_write_lock:
+            for row in batch:
+                stage, reason = _classify_clean_stage(row)
+                conn.execute(
+                    "UPDATE businesses SET pipeline_stage=?, stage_reason=?, cleaned_at=? WHERE id=?",
+                    (stage, reason, now, row["id"]),
+                )
+                if stage == "clean":
+                    stats["clean"] += 1
+                elif stage == "flagged":
+                    stats["flagged"] += 1
+                else:
+                    stats["failed"] += 1
+                stats["checked"] += 1
+            conn.commit()
         if progress:
             progress(stats["checked"], total, stats)
     return stats
@@ -1190,27 +1239,28 @@ def _persist_job(job_id: str) -> None:
     updated_at = datetime.utcnow().isoformat()
     try:
         timeout_seconds = JOB_CHECKPOINT_BUSY_TIMEOUT_MS / 1000
-        with closing(sqlite3.connect(DB_PATH, timeout=timeout_seconds)) as conn:
-            conn.execute(f"PRAGMA busy_timeout={JOB_CHECKPOINT_BUSY_TIMEOUT_MS}")
-            conn.execute(
-                """
-                INSERT INTO job_runs (id, status, keyword, updated_at, payload_json)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    status=excluded.status,
-                    keyword=excluded.keyword,
-                    updated_at=excluded.updated_at,
-                    payload_json=excluded.payload_json
-                """,
-                (
-                    job_id,
-                    snapshot.get("status") or "unknown",
-                    snapshot.get("keyword") or "",
-                    updated_at,
-                    json.dumps(snapshot, separators=(",", ":")),
-                ),
-            )
-            conn.commit()
+        with _db_write_lock:
+            with closing(sqlite3.connect(DB_PATH, timeout=timeout_seconds)) as conn:
+                conn.execute(f"PRAGMA busy_timeout={JOB_CHECKPOINT_BUSY_TIMEOUT_MS}")
+                conn.execute(
+                    """
+                    INSERT INTO job_runs (id, status, keyword, updated_at, payload_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        status=excluded.status,
+                        keyword=excluded.keyword,
+                        updated_at=excluded.updated_at,
+                        payload_json=excluded.payload_json
+                    """,
+                    (
+                        job_id,
+                        snapshot.get("status") or "unknown",
+                        snapshot.get("keyword") or "",
+                        updated_at,
+                        json.dumps(snapshot, separators=(",", ":")),
+                    ),
+                )
+                conn.commit()
     except sqlite3.Error as exc:
         # Losing one checkpoint must not end the scrape. The next event retries.
         log.warning("Could not persist job %s checkpoint: %s", job_id, exc)
@@ -1218,9 +1268,10 @@ def _persist_job(job_id: str) -> None:
 
 def _delete_persisted_job(job_id: str) -> None:
     try:
-        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
-            conn.execute("DELETE FROM job_runs WHERE id = ?", (job_id,))
-            conn.commit()
+        with _db_write_lock:
+            with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+                conn.execute("DELETE FROM job_runs WHERE id = ?", (job_id,))
+                conn.commit()
     except sqlite3.Error as exc:
         log.warning("Could not delete rejected job %s checkpoint: %s", job_id, exc)
 
@@ -1230,19 +1281,20 @@ def _store_job_secret(job_id: str, api_key: str) -> bool:
     if not api_key:
         return True
     try:
-        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
-            conn.execute("PRAGMA busy_timeout=5000")
-            conn.execute(
-                """
-                INSERT INTO job_secrets (job_id, api_key, updated_at)
-                VALUES (?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                    api_key=excluded.api_key,
-                    updated_at=excluded.updated_at
-                """,
-                (job_id, api_key, datetime.utcnow().isoformat()),
-            )
-            conn.commit()
+        with _db_write_lock:
+            with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+                conn.execute("PRAGMA busy_timeout=5000")
+                conn.execute(
+                    """
+                    INSERT INTO job_secrets (job_id, api_key, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(job_id) DO UPDATE SET
+                        api_key=excluded.api_key,
+                        updated_at=excluded.updated_at
+                    """,
+                    (job_id, api_key, datetime.utcnow().isoformat()),
+                )
+                conn.commit()
         return True
     except sqlite3.Error as exc:
         log.error("Could not persist recovery credential for job %s: %s", job_id, exc)
@@ -1251,9 +1303,10 @@ def _store_job_secret(job_id: str, api_key: str) -> bool:
 
 def _delete_job_secret(job_id: str) -> None:
     try:
-        with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
-            conn.execute("DELETE FROM job_secrets WHERE job_id=?", (job_id,))
-            conn.commit()
+        with _db_write_lock:
+            with closing(sqlite3.connect(DB_PATH, timeout=5)) as conn:
+                conn.execute("DELETE FROM job_secrets WHERE job_id=?", (job_id,))
+                conn.commit()
     except sqlite3.Error as exc:
         log.warning("Could not delete recovery credential for job %s: %s", job_id, exc)
 

@@ -2,6 +2,7 @@ import os
 import queue
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -108,6 +109,56 @@ class StageBatchingTests(unittest.TestCase):
             "scraped",
         )
         conn.close()
+
+    def test_full_pipeline_drops_place_details_before_enrichment(self):
+        job = {
+            "id": "phase-memory",
+            "type": app.JOB_TYPE_SCRAPE,
+            "status": "queued",
+            "keyword": "plumber",
+            "vertical": "plumbing",
+            "zip_codes": [],
+            "pending_zips": [],
+            "completed_zips": [],
+            "total": 0,
+            "processed": 0,
+            "inserted": 0,
+            "duplicates": 0,
+            "geo_rejected": 0,
+            "no_website_prospect": 0,
+            "run_mode": "full_pipeline",
+            "queued_at": "2026-09-06T12:00:00",
+            "started_at": "2026-09-06T12:00:00",
+            "completed_at": None,
+            "error": None,
+            "events": [],
+        }
+        with app._jobs_lock:
+            app._jobs[job["id"]] = job
+        with app._details_lock:
+            app._details_cache["large-place"] = {"payload": "x" * 100_000}
+
+        cache_sizes = []
+
+        def fake_enrich(*_args, **_kwargs):
+            with app._details_lock:
+                cache_sizes.append(len(app._details_cache))
+            return {"checked": 0, "enriched": 0, "no_email": 0, "errors": 0, "cancelled": False}
+
+        with (
+            mock.patch.object(app, "_enrich_stage_rows", side_effect=fake_enrich),
+            mock.patch.object(
+                app,
+                "_clean_stage_rows",
+                return_value={"checked": 0, "clean": 0, "flagged": 0, "failed": 0, "cancelled": False},
+            ),
+            mock.patch.object(app, "_release_process_memory"),
+        ):
+            app._run_job(job["id"], "test-key")
+
+        self.assertEqual(cache_sizes, [0])
+        with app._jobs_lock:
+            app._jobs.pop(job["id"], None)
 
     def test_startup_quarantines_only_rows_left_in_flight(self):
         conn = app.get_conn()
@@ -436,6 +487,24 @@ class PersistentJobTests(unittest.TestCase):
             connect.call_args.kwargs["timeout"],
             app.JOB_CHECKPOINT_BUSY_TIMEOUT_MS / 1000,
         )
+
+    def test_checkpoint_serializes_with_other_in_process_writers(self):
+        with app._jobs_lock:
+            app._jobs["serialized"] = {
+                "id": "serialized", "status": "queued", "keyword": "test"
+            }
+        finished = threading.Event()
+
+        def persist():
+            app._persist_job("serialized")
+            finished.set()
+
+        with app._db_write_lock:
+            thread = threading.Thread(target=persist)
+            thread.start()
+            self.assertFalse(finished.wait(0.05))
+        thread.join(timeout=2)
+        self.assertTrue(finished.is_set())
 
     def test_maps_api_retries_are_bounded(self):
         with (
