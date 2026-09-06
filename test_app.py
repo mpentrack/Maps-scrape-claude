@@ -506,6 +506,41 @@ class PersistentJobTests(unittest.TestCase):
         thread.join(timeout=2)
         self.assertTrue(finished.is_set())
 
+    def test_duplicate_insert_releases_sqlite_writer_transaction(self):
+        conn = app.get_conn()
+        row = {
+            "business_name": "Duplicate",
+            "address": "1 Main St",
+            "city": "Hartford",
+            "phone": "860-555-0100",
+            "website_url": "https://duplicate.example",
+            "rating": 4.5,
+            "review_count": 12,
+            "category": "electrician",
+            "zip_code": "06103",
+            "search_zip": "06103",
+        }
+        insert_lock = threading.Lock()
+
+        self.assertTrue(app._insert(conn, insert_lock, row))
+        self.assertFalse(app._insert(conn, insert_lock, row))
+        self.assertFalse(conn.in_transaction)
+
+        # A separate checkpoint connection must be able to write immediately
+        # after the duplicate instead of waiting on the scrape connection.
+        with app._jobs_lock:
+            app._jobs["after-duplicate"] = {
+                "id": "after-duplicate", "status": "running", "keyword": "test"
+            }
+        app._persist_job("after-duplicate")
+        check_conn = app.get_conn()
+        saved = check_conn.execute(
+            "SELECT status FROM job_runs WHERE id='after-duplicate'"
+        ).fetchone()
+        self.assertEqual(saved["status"], "running")
+        check_conn.close()
+        conn.close()
+
     def test_maps_api_retries_are_bounded(self):
         with (
             mock.patch.object(app.requests, "get", side_effect=app.requests.Timeout) as get,

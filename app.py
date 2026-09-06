@@ -517,6 +517,12 @@ def _insert(
             conn.commit()
             return True
         except sqlite3.IntegrityError:
+            # A uniqueness miss still opens a SQLite write transaction.  If it
+            # is left active, this long-lived scrape connection can retain the
+            # writer lock while the worker performs network requests, causing
+            # otherwise serialized job checkpoints to fail with "database is
+            # locked".  End the failed transaction immediately.
+            conn.rollback()
             return False
 
 
