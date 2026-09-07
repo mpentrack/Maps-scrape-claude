@@ -106,6 +106,25 @@ class BenchmarkHelpersTests(unittest.TestCase):
             )
         self.assertEqual([row["business_name"] for row in cohort], ["Local"])
 
+    def test_cohort_offset_advances_past_previous_domains(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "businesses.db"
+            conn = sqlite3.connect(path)
+            conn.execute(
+                "CREATE TABLE businesses (id INTEGER PRIMARY KEY, business_name TEXT, "
+                "website_url TEXT, email TEXT, city TEXT, zip_code TEXT, search_zip TEXT, "
+                "rating REAL, review_count INTEGER, category TEXT, search_keyword TEXT, "
+                "vertical TEXT, pipeline_stage TEXT, stage_reason TEXT)"
+            )
+            for i in range(1, 4):
+                conn.execute(
+                    "INSERT INTO businesses VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (i, f"Local {i}", f"https://local{i}.example", None, "Melbourne", "32901", "32901", 5, 10-i, "HVAC", "x", "x", "scraped", None),
+                )
+            conn.commit(); conn.close()
+            cohort = select_cohort(str(path), limit=1, excluded_domains=set(), zip_prefixes=["329"], offset=1)
+        self.assertEqual([row["business_name"] for row in cohort], ["Local 2"])
+
 
 if __name__ == "__main__":
     unittest.main()

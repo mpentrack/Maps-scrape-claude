@@ -131,6 +131,7 @@ def select_cohort(
     excluded_domains: set[str],
     zip_prefixes: list[str],
     max_domain_locations: int = 5,
+    offset: int = 0,
 ) -> list[dict]:
     conn = sqlite3.connect(f"file:{Path(db_path).resolve()}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
@@ -159,8 +160,9 @@ def select_cohort(
             clauses.append("COALESCE(zip_code, '') LIKE ?")
             params.append(prefix + "%")
         query += " AND (" + " OR ".join(clauses) + ")"
-    query += " ORDER BY COALESCE(review_count, 0) DESC, id ASC LIMIT ?"
+    query += " ORDER BY COALESCE(review_count, 0) DESC, id ASC LIMIT ? OFFSET ?"
     params.append(max(limit * 30, 1000))
+    params.append(max(0, offset))
     rows = conn.execute(query, params).fetchall()
     conn.close()
 
@@ -251,6 +253,7 @@ def main() -> None:
     parser.add_argument("--instantly-csv")
     parser.add_argument("--output-dir", default="benchmark_output")
     parser.add_argument("--limit", type=int, default=10)
+    parser.add_argument("--offset", type=int, default=0)
     parser.add_argument("--zip-prefix", action="append", default=[])
     parser.add_argument(
         "--max-domain-locations",
@@ -283,6 +286,7 @@ def main() -> None:
         excluded_domains=excluded_domains,
         zip_prefixes=args.zip_prefix,
         max_domain_locations=max(1, args.max_domain_locations),
+        offset=max(0, args.offset),
     )
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
