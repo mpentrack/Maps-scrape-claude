@@ -41,9 +41,20 @@ class BenchmarkHelpersTests(unittest.TestCase):
         self.assertEqual(_unique_emails(payload), ["jane@example.com"])
 
     def test_openweb_contacts_preserve_per_email_source(self):
-        payload = {"emails": [{"value": "jane@example.com", "sources": ["https://example.com/team"]}]}
+        payload = {"data": [{"emails": [{"value": "jane@example.com", "sources": ["https://example.com/team"]}]}]}
         contacts = _openweb_email_contacts(payload)
         self.assertEqual(contacts[0].source_url, "https://example.com/team")
+
+    def test_openweb_contacts_drop_malformed_and_unrelated_domains(self):
+        payload = {"emails": [
+            {"value": "danny@ex.combarkerac.com"},
+            {"value": "danny@ex.com"},
+            {"value": "owner@barkerac.com"},
+            {"value": "owner@gmail.com"},
+            {"value": "1996@gmail.com"},
+        ]}
+        contacts = _openweb_email_contacts(payload, expected_domain="barkerac.com")
+        self.assertEqual([c.email for c in contacts], ["owner@barkerac.com", "owner@gmail.com"])
 
     def test_campaign_eligibility_rejects_public_and_corporate_records(self):
         self.assertEqual(

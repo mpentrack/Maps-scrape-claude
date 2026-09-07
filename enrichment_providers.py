@@ -111,10 +111,19 @@ def _first_http_url(value: Any) -> str | None:
     return None
 
 
-def _openweb_email_contacts(body: Any) -> list[ContactResult]:
+FREE_EMAIL_DOMAINS = {
+    "gmail.com", "googlemail.com", "outlook.com", "hotmail.com", "live.com",
+    "icloud.com", "me.com", "yahoo.com", "ymail.com", "aol.com",
+}
+
+
+def _openweb_email_contacts(body: Any, expected_domain: str | None = None) -> list[ContactResult]:
     contacts: list[ContactResult] = []
     seen: set[str] = set()
-    raw_emails = body.get("emails", []) if isinstance(body, dict) else []
+    payload = body
+    if isinstance(body, dict) and isinstance(body.get("data"), list):
+        payload = body["data"][0] if body["data"] else {}
+    raw_emails = payload.get("emails", []) if isinstance(payload, dict) else []
     if isinstance(raw_emails, list):
         for item in raw_emails:
             if isinstance(item, dict):
@@ -126,10 +135,26 @@ def _openweb_email_contacts(body: Any) -> list[ContactResult]:
                 )
             else:
                 email, source_url = item, None
-            if isinstance(email, str) and EMAIL_RE.fullmatch(email.strip()) and email.lower() not in seen:
+            if not isinstance(email, str) or not EMAIL_RE.fullmatch(email.strip()):
+                continue
+            email = email.strip().lower()
+            local, email_domain = email.rsplit("@", 1)
+            # Website scrapers occasionally capture adjacent HTML/text as an
+            # apparently valid address. Reject these and unrelated domains;
+            # retain legitimate free-mail addresses because small local firms
+            # often publish an owner's Gmail address.
+            if ".com" in email_domain[:-4] or (
+                expected_domain
+                and email_domain != expected_domain
+                and email_domain not in FREE_EMAIL_DOMAINS
+            ):
+                continue
+            if local.isdigit() or email.lower() in seen:
+                continue
+            if isinstance(email, str) and email.lower() not in seen:
                 seen.add(email.lower())
                 contacts.append(ContactResult(
-                    email=email.strip().lower(),
+                    email=email,
                     email_status="public_unverified",
                     source_url=source_url,
                     source_context="OpenWeb Ninja website contacts result",
@@ -158,7 +183,7 @@ def openwebninja_contacts(
             return ProviderResult(
                 "openwebninja", "error", http_status=status, error=_safe_error(body)
             )
-        contacts = _openweb_email_contacts(body)
+        contacts = _openweb_email_contacts(body, expected_domain=domain)
         return ProviderResult(
             "openwebninja",
             "found" if contacts else "not_found",
