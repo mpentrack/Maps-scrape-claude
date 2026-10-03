@@ -13,6 +13,8 @@ import os
 import queue
 import re
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -27,7 +29,7 @@ import requests
 from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import formatted_address_from_item, resolve_city
-from email_extract import USER_AGENT as ENRICH_USER_AGENT, env_int, scrape_email_for_website
+from email_extract import EmailScrapeResult, env_int
 from maps_item import contact_fields_from_maps_item, iter_search_results
 from zip_geocode import us_zip_latlng
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
@@ -56,7 +58,8 @@ MAPS_REQUEST_TIMEOUT = env_int("MAPS_REQUEST_TIMEOUT", 15, maximum=30)
 # containers. Every enrichment worker can hold a parsed HTML document, and a
 # scrape worker can hold a Maps search + place-details response.
 JOB_WORKERS = env_int("JOB_WORKERS", 3, maximum=3)
-ENRICH_WORKERS = env_int("ENRICH_WORKERS", 5, maximum=6)
+ENRICH_WORKERS = env_int("ENRICH_WORKERS", 3, maximum=3)
+CRAWL_TIMEOUT_SECONDS = env_int("CRAWL_TIMEOUT_SECONDS", 120, minimum=10, maximum=150)
 MX_WORKERS = env_int("MX_WORKERS", 5, maximum=8)
 MAX_QUEUED_JOBS = env_int("MAX_QUEUED_JOBS", 20, maximum=50)
 MAX_ZIPS_PER_JOB = env_int("MAX_ZIPS_PER_JOB", 5000, maximum=5000)
@@ -644,7 +647,7 @@ def _scrape_zip(
     return inserted, skipped, geo_rejected, no_website
 
 
-_ENRICH_PROGRESS_KEYS = ("checked", "enriched", "no_email")
+_ENRICH_PROGRESS_KEYS = ("checked", "enriched", "no_email", "errors")
 _CLEAN_PROGRESS_KEYS = ("checked", "clean", "flagged", "failed")
 
 
@@ -960,6 +963,26 @@ def _count_stage_rows(
     return min(total, limit) if limit else total
 
 
+def _crawl_website_bounded(website_url: str) -> EmailScrapeResult:
+    """Kill and reap an entire crawl on timeout, including DNS/parser hangs.
+
+    A Future timeout alone leaves its thread running and the executor waits
+    forever at shutdown. subprocess.run kills and waits for this child instead.
+    The child never opens SQLite or receives the Maps API credential.
+    """
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).with_name("crawl_worker.py"))],
+        input=json.dumps({
+            "website_url": website_url,
+            "allow_generic_fallback": EMAIL_ALLOW_GENERIC_FALLBACK,
+        }),
+        capture_output=True, text=True, timeout=CRAWL_TIMEOUT_SECONDS,
+        env={k: v for k, v in os.environ.items() if k != "RAPIDAPI_KEY"},
+        check=True,
+    )
+    return EmailScrapeResult(**json.loads(completed.stdout))
+
+
 def _enrich_stage_rows(
     conn: sqlite3.Connection,
     from_stage: str,
@@ -986,17 +1009,7 @@ def _enrich_stage_rows(
     def task(row):
         row_id = row["id"] if isinstance(row, sqlite3.Row) else row[0]
         website_url = row["website_url"] if isinstance(row, sqlite3.Row) else row[1]
-        session = requests.Session()
-        session.headers.update({"User-Agent": ENRICH_USER_AGENT})
-        try:
-            res = scrape_email_for_website(
-                website_url,
-                session,
-                allow_generic_fallback=EMAIL_ALLOW_GENERIC_FALLBACK,
-            )
-            return row_id, res
-        finally:
-            session.close()
+        return row_id, _crawl_website_bounded(website_url)
 
     # Keyset pagination is important here. The production database can contain
     # well over 100k rows; fetchall() made a supposedly batched job materialize
@@ -1008,10 +1021,7 @@ def _enrich_stage_rows(
             if should_cancel and should_cancel():
                 stats["cancelled"] = True
                 break
-            # Only keep one worker-width of websites in flight. If every
-            # website in a group wedges below Requests' socket layer, the
-            # watchdog restarts the process and startup quarantines at most
-            # ENRICH_WORKERS rows instead of replaying a 200-row batch forever.
+            # At most one child per worker; every child has a hard deadline.
             batch_size = min(PROGRESS_CHUNK_ROWS, ENRICH_WORKERS, total - stats["checked"])
             where = _ENRICH_CANDIDATE_WHERE
             params: list[object] = [from_stage]
@@ -1072,12 +1082,14 @@ def _enrich_stage_rows(
                             )
                     except Exception as exc:
                         stats["errors"] += 1
+                        reason = "crawl_timeout" if isinstance(exc, subprocess.TimeoutExpired) else "crawl_error"
                         conn.execute(
                             "UPDATE businesses SET pipeline_stage='enrich_failed', "
-                            "stage_reason='crawl_error', enriched_at=? WHERE id=?",
-                            (datetime.utcnow().isoformat(), row_id),
+                            "stage_reason=?, enriched_at=? WHERE id=?",
+                            (reason, datetime.utcnow().isoformat(), row_id),
                         )
-                        log.warning("Enrichment failed for one row: %s", exc)
+                        log.warning("Enrichment row=%s job=%s failed: %s (%s)",
+                                    row_id, source_job_id or "bulk", reason, type(exc).__name__)
                     stats["checked"] += 1
                     # Release SQLite's writer lock before the durable job heartbeat
                     # opens its own short-lived connection.
@@ -1575,6 +1587,9 @@ def health():
         "active_jobs": active,
         "queue_depth": _job_queue.qsize(),
         "queue_capacity": MAX_QUEUED_JOBS,
+        "crawl_isolation": "subprocess",
+        "crawl_timeout_seconds": CRAWL_TIMEOUT_SECONDS,
+        "enrichment_workers": ENRICH_WORKERS,
     })
     return response, 200 if worker_alive and not stalled else 503
 

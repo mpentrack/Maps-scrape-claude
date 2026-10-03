@@ -1,9 +1,12 @@
 import os
 import queue
 import sqlite3
+import subprocess
 import tempfile
 import threading
+import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -23,6 +26,70 @@ class StageBatchingTests(unittest.TestCase):
         app.DB_PATH = self.original_db_path
         self.temp_dir.cleanup()
 
+    def test_hung_crawl_is_killed_and_next_lead_and_cleaning_complete(self):
+        release = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                body = b"<p>owner@example.com</p>"
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", "1000" if self.path.startswith("/hang") else str(len(body)))
+                self.end_headers()
+                if self.path.startswith("/hang"):
+                    release.wait(15)
+                else:
+                    self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{server.server_port}"
+        conn = app.get_conn()
+        conn.executemany(
+            "INSERT INTO businesses (business_name, website_url, pipeline_stage, source_job_id) "
+            "VALUES (?, ?, 'scraped', 'isolation-test')",
+            [("Hung", base + "/hang"), ("Healthy", base)],
+        )
+        conn.commit()
+        children = []
+        real_popen = subprocess.Popen
+
+        def track_child(*args, **kwargs):
+            child = real_popen(*args, **kwargs)
+            children.append(child)
+            return child
+
+        started = time.monotonic()
+        try:
+            with (
+                mock.patch.object(app, "ENRICH_WORKERS", 1),
+                mock.patch.object(app, "CRAWL_TIMEOUT_SECONDS", 2),
+                mock.patch.object(subprocess, "Popen", side_effect=track_child),
+                mock.patch.dict(os.environ, {"REQUEST_TIMEOUT": "30"}),
+            ):
+                result = app._enrich_stage_rows(conn, "scraped", None, source_job_id="isolation-test")
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertEqual(result["checked"], 2)
+            self.assertEqual(result["errors"], 1)
+            self.assertEqual(result["enriched"], 1)
+            self.assertEqual(len(children), 2)
+            self.assertTrue(all(child.poll() is not None for child in children))
+            rows = conn.execute("SELECT pipeline_stage, stage_reason FROM businesses ORDER BY id").fetchall()
+            self.assertEqual(tuple(rows[0]), ("enrich_failed", "crawl_timeout"))
+            self.assertEqual(rows[1]["pipeline_stage"], "enriched")
+            with mock.patch.object(app, "has_mx", return_value=True):
+                cleaned = app._clean_stage_rows(conn, "enriched", None, source_job_id="isolation-test")
+            self.assertEqual(cleaned["clean"], 1)
+        finally:
+            release.set()
+            server.shutdown()
+            server.server_close()
+            conn.close()
+
     def test_enrichment_reads_one_bounded_batch_at_a_time(self):
         conn = app.get_conn()
         conn.executemany(
@@ -34,14 +101,13 @@ class StageBatchingTests(unittest.TestCase):
         conn.set_trace_callback(statements.append)
         progress = []
 
-        def fake_scrape(_website_url, _session, *, allow_generic_fallback):
-            self.assertFalse(allow_generic_fallback)
+        def fake_scrape(_website_url):
             return EmailScrapeResult("owner@example.com", None)
 
         with (
             mock.patch.object(app, "PROGRESS_CHUNK_ROWS", 25),
             mock.patch.object(app, "ENRICH_WORKERS", 4),
-            mock.patch.object(app, "scrape_email_for_website", side_effect=fake_scrape),
+            mock.patch.object(app, "_crawl_website_bounded", side_effect=fake_scrape),
         ):
             result = app._enrich_stage_rows(
                 conn,
@@ -88,7 +154,7 @@ class StageBatchingTests(unittest.TestCase):
 
         with mock.patch.object(
             app,
-            "scrape_email_for_website",
+            "_crawl_website_bounded",
             return_value=EmailScrapeResult("owner@example.com", None),
         ):
             result = app._enrich_stage_rows(
