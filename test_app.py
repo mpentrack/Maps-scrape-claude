@@ -31,7 +31,7 @@ class StageBatchingTests(unittest.TestCase):
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                body = b"<p>owner@example.com</p>"
+                body = b"<p>owner@healthy.test</p>"
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Content-Length", "1000" if self.path.startswith("/hang") else str(len(body)))
@@ -350,15 +350,56 @@ class ResponseMemoryLimitTests(unittest.TestCase):
           <script type="application/ld+json">
             {"address": {"addressLocality": "Hartford"}}
           </script>
-        </head><body><a href="mailto:owner@example.com">Email</a></body></html>
+        </head><body><a href="mailto:owner@clinic.test">Email</a></body></html>
         """
         real_parser = email_extract.BeautifulSoup
         with mock.patch.object(email_extract, "BeautifulSoup", wraps=real_parser) as parser:
             emails, city = email_extract.extract_page_contacts(html)
 
         self.assertEqual(parser.call_count, 1)
-        self.assertEqual(emails, ["owner@example.com"])
+        self.assertEqual(emails, ["owner@clinic.test"])
         self.assertEqual(city, "Hartford")
+
+    def test_rejected_email_substrings_never_become_candidates_or_saved_results(self):
+        html = " ".join((
+            "owner@example.com", "owner@email.com", "hello@mywixsite.com",
+            "support@godaddy.com", "wix-owner@clinic.test", "owner@clinic.test",
+        ))
+        self.assertEqual(email_extract.extract_email_candidates(html), ["owner@clinic.test"])
+        supplied = [
+            "OWNER@EXAMPLE.COM", "owner@email.com", "hello@mywixsite.com",
+            "support@godaddy.com", "wix-owner@clinic.test", "owner@clinic.test",
+        ]
+        self.assertEqual(email_extract.rank_emails(supplied, "https://clinic.test"), ["owner@clinic.test"])
+        self.assertEqual(
+            email_extract.pick_best_email(
+                supplied, allow_generic_fallback=True, website_url="https://clinic.test"
+            ),
+            "owner@clinic.test",
+        )
+        with (
+            mock.patch.object(email_extract, "MAX_PAGES_PER_DOMAIN", 1),
+            mock.patch.object(email_extract, "ENABLE_WHOIS_FALLBACK", False),
+            mock.patch.object(email_extract, "http_get_text", return_value=html),
+        ):
+            result = email_extract.scrape_email_for_website(
+                "https://clinic.test", mock.Mock(), allow_generic_fallback=True
+            )
+        self.assertEqual(result.email, "owner@clinic.test")
+        self.assertEqual(result.all_emails, "owner@clinic.test")
+
+    def test_rejected_emails_alone_are_not_reported_even_from_whois(self):
+        with (
+            mock.patch.object(email_extract, "MAX_PAGES_PER_DOMAIN", 1),
+            mock.patch.object(email_extract, "ENABLE_WHOIS_FALLBACK", True),
+            mock.patch.object(email_extract, "http_get_text", return_value="owner@example.com"),
+            mock.patch.object(email_extract, "whois_email_for_domain", return_value="owner@godaddy.com"),
+        ):
+            result = email_extract.scrape_email_for_website(
+                "https://clinic.test", mock.Mock(), allow_generic_fallback=True
+            )
+        self.assertIsNone(result.email)
+        self.assertIsNone(result.all_emails)
 
     def test_http_body_is_streamed_and_truncated_at_configured_limit(self):
         class FakeResponse:

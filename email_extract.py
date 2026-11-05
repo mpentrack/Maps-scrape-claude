@@ -200,6 +200,11 @@ _JUNK_EMAIL_DOMAIN_SUFFIXES = (
     ".css", ".js", ".json", ".woff", ".woff2",
 )
 
+# Reject these strings anywhere in an email address, including its local part.
+# Keep this at the shared candidate filter so rejected addresses never reach
+# either the chosen email or the all_emails field.
+REJECTED_EMAIL_SUBSTRINGS = ("example.com", "email.com", "wix", "godaddy")
+
 
 # ---------------------------------------------------------------------------
 # Ad-tech / call-tracking fingerprints
@@ -373,8 +378,9 @@ def is_generic_email(email: str) -> bool:
 
 
 def is_plausible_email(email: str) -> bool:
-    dom = email.split("@", -1)[-1].lower()
-    return not dom.endswith(_JUNK_EMAIL_DOMAIN_SUFFIXES)
+    value = email.strip().lower()
+    dom = value.split("@", -1)[-1]
+    return not any(term in value for term in REJECTED_EMAIL_SUBSTRINGS) and not dom.endswith(_JUNK_EMAIL_DOMAIN_SUFFIXES)
 
 
 def _site_host_for_match(website_url: str) -> str:
@@ -724,7 +730,7 @@ def scrape_email_for_website(
         hostname = ""
     if hostname and ENABLE_WHOIS_FALLBACK:
         w_email = whois_email_for_domain(hostname)
-        if w_email and (allow_generic_fallback or not is_generic_email(w_email)):
+        if w_email and is_plausible_email(w_email) and (allow_generic_fallback or not is_generic_email(w_email)):
             with_whois = ",".join(rank_emails(ranked + [w_email], website_url)) or None
             return EmailScrapeResult(w_email, None, city_found, with_whois, signals)
 
