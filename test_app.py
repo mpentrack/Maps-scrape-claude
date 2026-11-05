@@ -1,3 +1,5 @@
+import csv
+import json
 import os
 import queue
 import sqlite3
@@ -684,6 +686,89 @@ class PersistentJobTests(unittest.TestCase):
         self.assertEqual(tuple(rows[0]), ("scraped", "https://abc.example", "first"))
         conn.close()
 
+    def test_geo_website_survives_enrichment_and_off_target_export(self):
+        conn = app.get_conn()
+        row = {
+            "business_name": "ABC Clinic", "address": "1 Main St, Hartford, CT 06103",
+            "city": "Hartford", "phone": "860-555-0100", "website_url": "https://abc.test",
+            "rating": 4.5, "review_count": 12, "category": "medical clinic",
+            "zip_code": "06103", "search_zip": "06104",
+        }
+        self.assertTrue(app._insert(conn, threading.Lock(), row, "geo_rejected", "geo_zip_mismatch"))
+        with mock.patch.object(app, "_crawl_website_bounded", return_value=EmailScrapeResult("owner@abc.test", None)):
+            result = app._enrich_stage_rows(conn, "geo_rejected", None)
+        self.assertEqual(result["enriched"], 1)
+        saved = conn.execute("SELECT pipeline_stage, geo_rejected, website_url FROM businesses").fetchone()
+        self.assertEqual(tuple(saved), ("enriched", 1, "https://abc.test"))
+
+        client = app.app.test_client()
+        self.assertEqual(client.get("/api/stats").get_json()["off_target_total"], 1)
+        self.assertEqual(client.get("/api/leads?stage=geo_rejected").get_json()["total"], 0)
+        self.assertEqual(client.get("/api/leads?stage=off_target").get_json()["total"], 1)
+        exported = list(csv.DictReader(client.get("/api/export?stage=off_target").data.decode().splitlines()))
+        self.assertEqual(len(exported), 1)
+        self.assertEqual(exported[0]["website_url"], "https://abc.test")
+        self.assertEqual(exported[0]["geo_rejected"], "1")
+
+        exact = {**row, "search_zip": "06103"}
+        self.assertFalse(app._insert(conn, threading.Lock(), exact, "scraped"))
+        self.assertEqual(client.get("/api/leads?stage=off_target").get_json()["total"], 0)
+        conn.close()
+
+    def test_legacy_bulk_geo_enrichment_is_recovered_once(self):
+        previous_db = app.DB_PATH
+        legacy_db = str(Path(self.temp_dir.name) / "legacy.db")
+        app.DB_PATH = legacy_db
+        try:
+            conn = sqlite3.connect(legacy_db)
+            conn.execute("CREATE TABLE businesses (id INTEGER PRIMARY KEY, business_name TEXT, address TEXT, "
+                         "phone TEXT, website_url TEXT, pipeline_stage TEXT, enriched_at TEXT, "
+                         "zip_code TEXT, search_zip TEXT)")
+            conn.executemany(
+                "INSERT INTO businesses (id, business_name, phone, website_url, pipeline_stage, enriched_at) "
+                "VALUES (?,?,?,?,?,?)",
+                [
+                    (1, "Pending", "1", None, "geo_rejected", None),
+                    (2, "From event", "2", "https://event.test", "enriched", "2026-11-05T10:15:00"),
+                    (3, "In target", "3", "https://exact.test", "enriched", "2026-11-05T09:15:00"),
+                    (4, "From previous job", "4", "https://prior.test", "enrich_failed", "2026-11-05T11:15:00"),
+                    (5, "Uncertain window", "5", "https://uncertain.test", "enriched", "2026-11-05T12:15:00"),
+                ],
+            )
+            conn.execute("CREATE TABLE job_runs (id TEXT PRIMARY KEY, status TEXT NOT NULL, "
+                         "keyword TEXT, updated_at TEXT NOT NULL, payload_json TEXT NOT NULL)")
+            jobs = [
+                {"id": "bulk-event", "type": "bulk_enrich", "from_stage": "geo_rejected",
+                 "status": "completed", "completed_at": "2026-11-05T10:30:00",
+                 "enriched": {"checked": 1}, "events": [
+                     {"ts": "2026-11-05T10:00:00", "message": "Bulk enrich started on stage 'geo_rejected'."}]},
+                {"id": "scrape", "type": "scrape", "status": "completed",
+                 "completed_at": "2026-11-05T11:00:00"},
+                {"id": "bulk-pruned", "type": "bulk_enrich", "from_stage": "geo_rejected",
+                 "status": "completed", "completed_at": "2026-11-05T11:30:00",
+                 "enriched": {"checked": 1}, "events": []},
+                {"id": "bulk-uncertain", "type": "bulk_enrich", "from_stage": "geo_rejected",
+                 "status": "completed", "completed_at": "2026-11-05T12:30:00",
+                 "enriched": {"checked": 2}, "events": []},
+            ]
+            conn.executemany("INSERT INTO job_runs VALUES (?,?,?,?,?)",
+                             [(j["id"], j["status"], "", j["completed_at"], json.dumps(j)) for j in jobs])
+            conn.commit()
+            conn.close()
+            app.init_db()
+            migrated = app.get_conn()
+            flags = [r[0] for r in migrated.execute("SELECT geo_rejected FROM businesses ORDER BY id")]
+            self.assertEqual(flags, [1, 1, 0, 1, 0])
+            migrated.execute("UPDATE businesses SET geo_rejected=0 WHERE id=2")
+            migrated.commit()
+            migrated.close()
+            app.init_db()
+            check = app.get_conn()
+            self.assertEqual(check.execute("SELECT geo_rejected FROM businesses WHERE id=2").fetchone()[0], 0)
+            check.close()
+        finally:
+            app.DB_PATH = previous_db
+
     def test_exact_result_without_url_preserves_known_geo_url(self):
         conn = app.get_conn()
         lock = threading.Lock()
@@ -831,7 +916,7 @@ class RuntimeHealthAndExportTests(unittest.TestCase):
         self.assertTrue(response.get_json()["worker_alive"])
 
     def test_export_streams_cursor_batches_without_fetchall(self):
-        columns_per_row = 22
+        columns_per_row = 23
 
         class FakeCursor:
             def __init__(self):

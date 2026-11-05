@@ -218,6 +218,7 @@ def init_db() -> None:
             created_at    TEXT DEFAULT (datetime('now')),
             pipeline_stage TEXT DEFAULT 'scraped',
             stage_reason   TEXT,
+            geo_rejected   INTEGER NOT NULL DEFAULT 0,
             enriched_at    TEXT,
             cleaned_at     TEXT
         )
@@ -230,12 +231,14 @@ def init_db() -> None:
     # Migrate existing DBs that lack the email column
     cols = {row[1] for row in conn.execute("PRAGMA table_info(businesses)")}
     city_was_new = "city" not in cols
+    geo_flag_was_new = "geo_rejected" not in cols
     for col, ddl in {
         "email": "ALTER TABLE businesses ADD COLUMN email TEXT",
         "city": "ALTER TABLE businesses ADD COLUMN city TEXT",
         "search_zip": "ALTER TABLE businesses ADD COLUMN search_zip TEXT",
         "pipeline_stage": "ALTER TABLE businesses ADD COLUMN pipeline_stage TEXT DEFAULT 'scraped'",
         "stage_reason": "ALTER TABLE businesses ADD COLUMN stage_reason TEXT",
+        "geo_rejected": "ALTER TABLE businesses ADD COLUMN geo_rejected INTEGER NOT NULL DEFAULT 0",
         "enriched_at": "ALTER TABLE businesses ADD COLUMN enriched_at TEXT",
         "cleaned_at": "ALTER TABLE businesses ADD COLUMN cleaned_at TEXT",
         "created_at": "ALTER TABLE businesses ADD COLUMN created_at TEXT",
@@ -300,6 +303,9 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_job_runs_updated
         ON job_runs (updated_at DESC)
     """)
+    conn.execute("UPDATE businesses SET geo_rejected=1 WHERE pipeline_stage='geo_rejected' AND geo_rejected=0")
+    if geo_flag_was_new:
+        _backfill_geo_rejections_from_bulk_jobs(conn)
     # Stored separately from the public job JSON. This lets Railway requeue
     # accepted work after a process restart without exposing RapidAPI keys via
     # /api/jobs. Secrets are deleted when their job reaches a terminal state.
@@ -312,6 +318,44 @@ def init_db() -> None:
     """)
     conn.commit()
     conn.close()
+
+
+def _backfill_geo_rejections_from_bulk_jobs(conn: sqlite3.Connection) -> None:
+    """Recover old off-target status when a completed bulk job replaced its stage.
+
+    Only apply a historical job window when its row count exactly matches the
+    job's checked count. This avoids guessing from a missing listing ZIP.
+    """
+    jobs = []
+    for saved in conn.execute("SELECT payload_json FROM job_runs"):
+        try:
+            jobs.append(json.loads(saved["payload_json"]))
+        except (TypeError, json.JSONDecodeError):
+            continue
+    completed = sorted(j["completed_at"] for j in jobs if j.get("completed_at"))
+    for job in jobs:
+        if (job.get("type") != JOB_TYPE_BULK_ENRICH
+                or job.get("from_stage") != "geo_rejected"
+                or job.get("status") != "completed"):
+            continue
+        finish = job.get("completed_at")
+        checked = (job.get("enriched") or {}).get("checked")
+        if not finish or not isinstance(checked, int) or checked <= 0:
+            continue
+        starts = [e.get("ts") for e in job.get("events", [])
+                  if "Bulk enrich started" in e.get("message", "") and e.get("ts")]
+        previous = [ts for ts in completed if ts < finish]
+        start = starts[0] if starts else (previous[-1] if previous else None)
+        if not start:
+            continue
+        where = "enriched_at > ? AND enriched_at <= ? AND website_url IS NOT NULL"
+        count = conn.execute(f"SELECT COUNT(*) FROM businesses WHERE {where}", (start, finish)).fetchone()[0]
+        if count == checked:
+            conn.execute(f"UPDATE businesses SET geo_rejected=1 WHERE {where}", (start, finish))
+            log.info("Recovered off-target status for %d row(s) from bulk job %s", count, job.get("id"))
+        else:
+            log.warning("Skipped off-target recovery for bulk job %s: %d rows vs %d checked",
+                        job.get("id"), count, checked)
 
 
 # ── Scraping helpers (self-contained so app.py has no import coupling) ────────
@@ -532,7 +576,7 @@ def _insert(
             # equal. It also cannot upgrade a row that was first seen outside
             # its target ZIP. Match the listing before attempting the insert.
             candidates = conn.execute(
-                "SELECT id, business_name, address, phone, website_url, pipeline_stage "
+                "SELECT id, business_name, address, phone, website_url, pipeline_stage, geo_rejected "
                 "FROM businesses WHERE (? IS NOT NULL AND phone=?) "
                 "OR (? IS NOT NULL AND website_url=?)",
                 (phone, phone, url, url),
@@ -546,7 +590,7 @@ def _insert(
                     conn.execute(
                         "UPDATE businesses SET business_name=?, address=?, city=?, phone=?, website_url=?, "
                         "rating=?, review_count=?, category=?, zip_code=?, search_zip=?, search_keyword=?, "
-                        "vertical=?, pipeline_stage=?, stage_reason=?, created_at=?, source_job_id=? "
+                        "vertical=?, pipeline_stage=?, stage_reason=?, geo_rejected=0, created_at=?, source_job_id=? "
                         "WHERE id=?",
                         (row["business_name"], row["address"], row.get("city"), phone, best_url,
                          row["rating"], row["review_count"], row["category"], row["zip_code"],
@@ -556,15 +600,25 @@ def _insert(
                     )
                     conn.commit()
                     return True
+                if existing["geo_rejected"] and pipeline_stage != "geo_rejected":
+                    # An already-enriched off-target listing can later be seen
+                    # in its exact ZIP. Keep its enrichment but clear the
+                    # durable off-target marker.
+                    conn.execute(
+                        "UPDATE businesses SET geo_rejected=0, zip_code=?, search_zip=? WHERE id=?",
+                        (row["zip_code"], row.get("search_zip"), existing["id"]),
+                    )
+                    conn.commit()
                 return False
             conn.execute(
                 "INSERT INTO businesses "
                 "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, "
-                "search_keyword, vertical, pipeline_stage, stage_reason, created_at, source_job_id) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "search_keyword, vertical, pipeline_stage, stage_reason, geo_rejected, created_at, source_job_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (row["business_name"], row["address"], row.get("city"), phone, url,
                  row["rating"], row["review_count"], row["category"], row["zip_code"], row.get("search_zip"),
-                 search_keyword, vertical, pipeline_stage, stage_reason, _now_eastern(), source_job_id),
+                 search_keyword, vertical, pipeline_stage, stage_reason,
+                 int(pipeline_stage == "geo_rejected"), _now_eastern(), source_job_id),
             )
             conn.commit()
             return True
@@ -1914,15 +1968,19 @@ def stats():
         stage_counts = conn.execute(
             "SELECT pipeline_stage, COUNT(*) cnt FROM businesses GROUP BY pipeline_stage ORDER BY cnt DESC"
         ).fetchall()
+        off_target_total = conn.execute(
+            "SELECT COUNT(*) FROM businesses WHERE geo_rejected=1 AND pipeline_stage!='archived'"
+        ).fetchone()[0]
         conn.close()
         return jsonify({
             "total":      total,
             "with_email": with_email,
+            "off_target_total": off_target_total,
             "categories": [{"name": r["category"], "count": r["cnt"]} for r in categories],
             "stages":     [{"name": r["pipeline_stage"] or "unknown", "count": r["cnt"]} for r in stage_counts],
         })
     except Exception:
-        return jsonify({"total": 0, "with_email": 0, "categories": [], "stages": []})
+        return jsonify({"total": 0, "with_email": 0, "off_target_total": 0, "categories": [], "stages": []})
 
 
 @app.route("/api/categories")
@@ -2026,7 +2084,7 @@ def export():
         "rating", "review_count", "category", "zip_code", "search_zip",
         "search_keyword", "vertical",
         "runs_google_ads", "aw_ids", "call_tracking", "has_gtm", "has_ga4",
-        "pipeline_stage", "stage_reason", "created_at",
+        "pipeline_stage", "stage_reason", "geo_rejected", "created_at",
     ]
     select_cols = ", ".join(columns)
     if has_email:
@@ -2084,7 +2142,9 @@ def _build_where(min_rating: float, min_reviews: int, has_email: bool, category:
         clauses.append("email IS NOT NULL AND email != ''")
     if category:
         clauses.append("category = ?");    params.append(category)
-    if stage:
+    if stage == "off_target":
+        clauses.append("geo_rejected = 1 AND pipeline_stage != 'archived'")
+    elif stage:
         clauses.append("pipeline_stage = ?"); params.append(stage)
     if vertical:
         clauses.append("LOWER(vertical) = ?"); params.append(vertical.strip().lower())

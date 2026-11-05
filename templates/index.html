@@ -416,7 +416,7 @@
             <label class="lbl">Source Stage</label>
             <select class="form-select" id="bulk-stage">
               <option value="scraped">scraped</option>
-              <option value="geo_rejected">geo_rejected (off-target)</option>
+              <option value="geo_rejected">geo_rejected (current stage)</option>
               <option value="enrich_failed">enrich_failed</option>
               <option value="enriched">enriched</option>
               <option value="archived">archived</option>
@@ -478,7 +478,7 @@
         <div class="card-body">
           <div class="legend-grid">
             <div class="legend-item"><span class="chip">scraped</span> <b>Step 1 complete:</b> lead captured from Maps API.</div>
-            <div class="legend-item"><span class="chip">geo_rejected</span> <b>Off-target:</b> API hit for your search ZIP, but address/ZIP fields don’t match our location check (still saved). Full-pipeline jobs skip these rows so targeted lists finalize sooner; use the bulk action above if you deliberately want to enrich them.</div>
+            <div class="legend-item"><span class="chip">geo_rejected</span> <b>Off-target:</b> API hit for your search ZIP, but address/ZIP fields don’t match our location check (still saved). This stage contains rows that have not moved to another processing stage. Use the Off-target (all stages) table filter to include enriched rows and export their websites.</div>
             <div class="legend-item"><span class="chip">enriched</span> <b>Step 2 complete:</b> email chosen from the site with same-domain addresses first, then other business domains, then Gmail/Yahoo/Outlook-style hosts if needed. Gmail etc. are not dropped unless you turn on strict cleaning (env <code>FLAG_FREE_EMAIL_DOMAINS</code>).</div>
             <div class="legend-item"><span class="chip">enrich_failed</span> <b>Step 2 failed:</b> no usable email (reason in <code>stage_reason</code>: <code>no_email_found</code>, or <code>only_generic_email</code> when the site only lists info@/hello@ and generic inboxes are disabled).</div>
             <div class="legend-item"><span class="chip">clean</span> <b>Step 3 complete:</b> passed quality checks.</div>
@@ -703,7 +703,7 @@ async function refreshJobs() {
         `<span style="color:var(--green)">+${n(j.inserted)} new</span>` +
         `<span>${n(j.duplicates)} dup</span>` +
         ((j.geo_rejected != null && j.geo_rejected > 0)
-          ? `<span style="color:var(--orange)" title="Rows saved with stage geo_rejected — filter Pipeline Stage">${n(j.geo_rejected)} off-target</span>`
+          ? `<span style="color:var(--orange)" title="Rows found off-target — use the Off-target (all stages) table filter">${n(j.geo_rejected)} off-target</span>`
           : '') +
         (j.enriched ? `<span>enriched ${n(j.enriched.enriched)}/${n(j.enriched.checked)}</span>` : '') +
         (j.cleaned  ? `<span>clean ${n(j.cleaned.clean)}/${n(j.cleaned.checked)}</span>` : '');
@@ -879,7 +879,8 @@ async function refreshStats() {
   const stageSel = document.getElementById('f-stage');
   const curStage = stageSel.value;
   stageSel.innerHTML = '<option value="">All stages</option>' +
-    (d.stages || []).map(s => `<option value="${esc(s.name)}"${s.name===curStage?' selected':''}>${esc(s.name)} (${s.count})</option>`).join('');
+    `<option value="off_target"${curStage==='off_target'?' selected':''}>Off-target (all stages) (${d.off_target_total || 0})</option>` +
+    (d.stages || []).map(s => `<option value="${esc(s.name)}"${s.name===curStage?' selected':''}>${s.name==='geo_rejected'?'geo_rejected (current stage)':esc(s.name)} (${s.count})</option>`).join('');
 
   // Category bars
   const catsEl = document.getElementById('cats-body');
@@ -948,7 +949,7 @@ async function loadLeads(page) {
       <td><span class="chip">${esc(r.category||'—')}</span></td>
       <td style="color:var(--muted)">${esc(r.city||'—')}</td>
       <td style="color:var(--muted)">${esc(r.zip_code||'—')}</td>
-      <td><span class="chip" title="${esc(r.stage_reason || '')}">${esc(r.pipeline_stage||'—')}${r.stage_reason ? ' · ' + esc(r.stage_reason) : ''}</span></td>
+      <td><span class="chip" title="${esc(r.stage_reason || '')}">${esc(r.pipeline_stage||'—')}${r.stage_reason ? ' · ' + esc(r.stage_reason) : ''}</span>${r.geo_rejected && r.pipeline_stage !== 'geo_rejected' ? ' <span class="chip" title="Off-target Maps result">off-target</span>' : ''}</td>
       <td style="white-space:nowrap;color:var(--muted);font-size:0.75rem">${esc(r.created_at ? r.created_at.slice(5,16).replace('T',' ') : '—')}</td>
     </tr>`).join('');
 }
