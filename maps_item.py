@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import re
 from typing import Any
+from urllib.parse import urlparse
 
 
 def iter_search_results(data: Any, _depth: int = 0) -> list[dict]:
@@ -62,6 +63,26 @@ def _first_str(*vals: Any) -> str | None:
             s = str(int(v)) if v == int(v) else str(v)
             if s.strip():
                 return s.strip()
+    return None
+
+
+def business_website_from_maps_item(item: dict[str, Any]) -> str | None:
+    """Return a business site field, excluding Maps listing links."""
+    urls = item.get("urls")
+    candidates = [item.get(k) for k in ("website", "website_url", "homepage", "site")]
+    if isinstance(urls, dict):
+        candidates.extend(urls.get(k) for k in ("website", "url", "primary"))
+    for value in candidates:
+        url = _first_str(value)
+        if not url:
+            continue
+        if not url.lower().startswith(("http://", "https://")):
+            url = "https://" + url.lstrip("/")
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        if host in ("maps.google.com", "www.google.com", "google.com") and parsed.path.startswith("/maps"):
+            continue
+        return url
     return None
 
 

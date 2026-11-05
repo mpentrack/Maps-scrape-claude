@@ -30,7 +30,7 @@ from flask import Flask, Response, jsonify, render_template, request
 
 from city_parse import formatted_address_from_item, resolve_city
 from email_extract import EmailScrapeResult, env_int
-from maps_item import contact_fields_from_maps_item, iter_search_results
+from maps_item import business_website_from_maps_item, contact_fields_from_maps_item, iter_search_results
 from zip_geocode import us_zip_latlng
 from geo_zip import best_listing_zip, listing_matches_search_zip, normalize_zip5
 from state_zips import STATE_NAMES, STATE_ZIPS
@@ -489,6 +489,9 @@ def _hydrate_row_location(row: dict, item: dict, zip_code: str, api_key: str) ->
         row["address"] = formatted_address_from_item(details)
     if not row.get("city"):
         row["city"] = resolve_city(details, row.get("address"), zip_code) or resolve_city(item, row.get("address"), zip_code)
+    detail_website = business_website_from_maps_item(details)
+    if detail_website and not business_website_from_maps_item({"website": row.get("website_url")}):
+        row["website_url"] = detail_website
     return details
 
 
@@ -641,9 +644,16 @@ def _scrape_zip(
             if job_id:
                 _job_event(job_id, "warning", "scrape", msg)
             break
+        page_geo_rows = page_geo_search_sites = page_geo_available_sites = 0
+        page_exact_rows = page_exact_search_sites = page_exact_available_sites = 0
+        page_detail_site_gains = 0
         for item in results:
             row = _parse(item, zip_code)
+            search_site = business_website_from_maps_item(item)
             item_for_match = _hydrate_row_location(row, item, zip_code, api_key)
+            available_site = business_website_from_maps_item({"website": row.get("website_url")})
+            if not search_site and available_site:
+                page_detail_site_gains += 1
             row["zip_code"] = best_listing_zip(item_for_match, row.get("address"))
             expected_zip = normalize_zip5(zip_code)
             strict_exact = os.environ.get("STRICT_EXACT_ZIP", "1").strip().lower() not in ("0", "false", "no", "off")
@@ -651,11 +661,17 @@ def _scrape_zip(
             geo_ok = listing_matches_search_zip(item_for_match, row.get("address"), zip_code)
             accept = exact_ok if strict_exact else geo_ok
             if not accept:
+                page_geo_rows += 1
+                page_geo_search_sites += bool(search_site)
+                page_geo_available_sites += bool(available_site)
                 if _insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch", keyword, vertical, job_id):
                     geo_rejected += 1
                 else:
                     skipped += 1
                 continue
+            page_exact_rows += 1
+            page_exact_search_sites += bool(search_site)
+            page_exact_available_sites += bool(available_site)
             if not row.get("website_url"):
                 if _insert(conn, lock, row, "no_website_prospect", "no_website", keyword, vertical, job_id):
                     no_website += 1
@@ -665,6 +681,14 @@ def _scrape_zip(
                 inserted += 1
             else:
                 skipped += 1
+        log.info(
+            "[scrape-job %s] zip=%s page=%d website coverage: exact=%d search_sites=%d available_sites=%d; "
+            "geo_rejected=%d search_sites=%d available_sites=%d; detail_site_gains=%d",
+            job_id or "-", zip_code, page,
+            page_exact_rows, page_exact_search_sites, page_exact_available_sites,
+            page_geo_rows, page_geo_search_sites, page_geo_available_sites,
+            page_detail_site_gains,
+        )
         log.info(
             "[scrape-job %s] zip=%s page=%d api_rows=%d cumulative new=%d dup=%d off_target=%d no_website=%d query=%r",
             job_id or "-",

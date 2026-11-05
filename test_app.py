@@ -728,6 +728,50 @@ class PersistentJobTests(unittest.TestCase):
             self.assertIsNone(app._fetch_place_details("place-two", "key"))
             self.assertEqual(api_get.call_count, 4)
 
+    def test_already_fetched_location_details_supply_missing_business_website(self):
+        item = {
+            "name": "ABC Clinic", "place_id": "abc-place", "phone_number": "860-555-0100",
+            "google_maps_url": "https://www.google.com/maps/place/abc",
+        }
+        row = app._parse(item, "06103")
+        details = {
+            "address": "1 Main St, Hartford, CT 06103", "city": "Hartford",
+            "website": "abc.example",
+        }
+        with mock.patch.object(app, "_fetch_place_details", return_value=details) as fetch:
+            app._hydrate_row_location(row, item, "06103", "key")
+        fetch.assert_called_once_with("abc-place", "key")
+        self.assertEqual(row["website_url"], "https://abc.example")
+
+    def test_existing_business_website_is_not_replaced_by_detail_website(self):
+        item = {
+            "name": "ABC Clinic", "place_id": "abc-place", "phone_number": "860-555-0100",
+            "website": "https://abc.example",
+        }
+        row = app._parse(item, "06103")
+        with mock.patch.object(app, "_fetch_place_details", return_value={"website": "https://other.example"}):
+            app._hydrate_row_location(row, item, "06103", "key")
+        self.assertEqual(row["website_url"], "https://abc.example")
+
+    def test_website_coverage_logs_counts_without_urls_or_extra_calls(self):
+        item = {
+            "name": "ABC Clinic", "address": "1 Main St, Hartford, CT 06103",
+            "phone_number": "860-555-0100", "website": "https://abc.example",
+        }
+        conn = app.get_conn()
+        with (
+            mock.patch.object(app, "us_zip_latlng", return_value=None),
+            mock.patch.object(app, "_api_get", return_value={"results": [item]}) as api_get,
+            mock.patch.object(app, "_fetch_place_details", side_effect=AssertionError("extra detail call")),
+            self.assertLogs(app.log, level="INFO") as captured,
+        ):
+            app._scrape_zip("06104", "clinic", "key", conn, threading.Lock())
+        self.assertEqual(api_get.call_count, 1)
+        coverage = next(msg for msg in captured.output if "website coverage:" in msg)
+        self.assertIn("geo_rejected=1 search_sites=1 available_sites=1", coverage)
+        self.assertNotIn("abc.example", coverage)
+        conn.close()
+
 
 class RuntimeHealthAndExportTests(unittest.TestCase):
     def setUp(self):
