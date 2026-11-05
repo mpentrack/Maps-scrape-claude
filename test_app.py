@@ -607,6 +607,73 @@ class PersistentJobTests(unittest.TestCase):
         check_conn.close()
         conn.close()
 
+    def test_exact_zip_result_upgrades_geo_rejected_row_without_website(self):
+        conn = app.get_conn()
+        lock = threading.Lock()
+        row = {
+            "business_name": "ABC Clinic", "address": "1 Main St, Hartford, CT 06103",
+            "city": "Hartford", "phone": "860-555-0100", "website_url": None,
+            "rating": 4.5, "review_count": 12, "category": "medical clinic",
+            "zip_code": "06103", "search_zip": "06104",
+        }
+        self.assertTrue(app._insert(conn, lock, row, "geo_rejected", "geo_zip_mismatch", source_job_id="first"))
+        exact = {**row, "website_url": "https://abc.example", "search_zip": "06103"}
+        self.assertTrue(app._insert(conn, lock, exact, "scraped", source_job_id="second"))
+        rows = conn.execute(
+            "SELECT pipeline_stage, website_url, search_zip, source_job_id FROM businesses"
+        ).fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(tuple(rows[0]), ("scraped", "https://abc.example", "06103", "second"))
+        conn.close()
+
+    def test_later_geo_rejection_cannot_downgrade_exact_result(self):
+        conn = app.get_conn()
+        lock = threading.Lock()
+        row = {
+            "business_name": "ABC Clinic", "address": "1 Main St, Hartford, CT 06103",
+            "city": "Hartford", "phone": "860-555-0100", "website_url": "https://abc.example",
+            "rating": 4.5, "review_count": 12, "category": "medical clinic",
+            "zip_code": "06103", "search_zip": "06103",
+        }
+        self.assertTrue(app._insert(conn, lock, row, "scraped", source_job_id="first"))
+        geo = {**row, "website_url": None, "search_zip": "06104"}
+        self.assertFalse(app._insert(conn, lock, geo, "geo_rejected", "geo_zip_mismatch", source_job_id="second"))
+        rows = conn.execute("SELECT pipeline_stage, website_url, source_job_id FROM businesses").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(tuple(rows[0]), ("scraped", "https://abc.example", "first"))
+        conn.close()
+
+    def test_exact_result_without_url_preserves_known_geo_url(self):
+        conn = app.get_conn()
+        lock = threading.Lock()
+        row = {
+            "business_name": "ABC Clinic", "address": "1 Main St, Hartford, CT 06103",
+            "city": "Hartford", "phone": "860-555-0100", "website_url": "https://abc.example",
+            "rating": 4.5, "review_count": 12, "category": "medical clinic",
+            "zip_code": "06103", "search_zip": "06104",
+        }
+        self.assertTrue(app._insert(conn, lock, row, "geo_rejected"))
+        exact = {**row, "website_url": None, "search_zip": "06103"}
+        self.assertTrue(app._insert(conn, lock, exact, "no_website_prospect", "no_website"))
+        saved = conn.execute("SELECT pipeline_stage, website_url, search_zip FROM businesses").fetchone()
+        self.assertEqual(tuple(saved), ("scraped", "https://abc.example", "06103"))
+        conn.close()
+
+    def test_shared_phone_does_not_merge_different_businesses(self):
+        conn = app.get_conn()
+        lock = threading.Lock()
+        row = {
+            "business_name": "ABC Clinic", "address": "1 Main St",
+            "city": "Hartford", "phone": "860-555-0100", "website_url": None,
+            "rating": 4.5, "review_count": 12, "category": "medical clinic",
+            "zip_code": "06103", "search_zip": "06104",
+        }
+        self.assertTrue(app._insert(conn, lock, row, "geo_rejected"))
+        other = {**row, "business_name": "XYZ Clinic", "address": "2 Main St", "search_zip": "06103"}
+        self.assertTrue(app._insert(conn, lock, other, "no_website_prospect"))
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM businesses").fetchone()[0], 2)
+        conn.close()
+
     def test_maps_api_retries_are_bounded(self):
         with (
             mock.patch.object(app.requests, "get", side_effect=app.requests.Timeout) as get,

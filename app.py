@@ -492,6 +492,23 @@ def _hydrate_row_location(row: dict, item: dict, zip_code: str, api_key: str) ->
     return details
 
 
+def _same_listing(existing: sqlite3.Row, row: dict) -> bool:
+    """Match a listing conservatively across searches of neighboring ZIPs."""
+    def key(value: str | None) -> str:
+        return "".join(ch for ch in (value or "").casefold() if ch.isalnum())
+
+    name = key(row.get("business_name"))
+    address = key(row.get("address"))
+    if not name or not address:
+        return False
+    if name != key(existing["business_name"]) or address != key(existing["address"]):
+        return False
+    return bool(
+        (row.get("phone") and row["phone"] == existing["phone"])
+        or (row.get("website_url") and row["website_url"] == existing["website_url"])
+    )
+
+
 def _insert(
     conn: sqlite3.Connection,
     lock: threading.Lock,
@@ -508,6 +525,35 @@ def _insert(
         return False
     with lock, _db_write_lock:
         try:
+            # SQLite's UNIQUE(phone, website_url) does not consider NULL values
+            # equal. It also cannot upgrade a row that was first seen outside
+            # its target ZIP. Match the listing before attempting the insert.
+            candidates = conn.execute(
+                "SELECT id, business_name, address, phone, website_url, pipeline_stage "
+                "FROM businesses WHERE (? IS NOT NULL AND phone=?) "
+                "OR (? IS NOT NULL AND website_url=?)",
+                (phone, phone, url, url),
+            ).fetchall()
+            for existing in candidates:
+                if not _same_listing(existing, row):
+                    continue
+                if existing["pipeline_stage"] == "geo_rejected" and pipeline_stage != "geo_rejected":
+                    best_url = url or existing["website_url"]
+                    best_stage = "scraped" if best_url else "no_website_prospect"
+                    conn.execute(
+                        "UPDATE businesses SET business_name=?, address=?, city=?, phone=?, website_url=?, "
+                        "rating=?, review_count=?, category=?, zip_code=?, search_zip=?, search_keyword=?, "
+                        "vertical=?, pipeline_stage=?, stage_reason=?, created_at=?, source_job_id=? "
+                        "WHERE id=?",
+                        (row["business_name"], row["address"], row.get("city"), phone, best_url,
+                         row["rating"], row["review_count"], row["category"], row["zip_code"],
+                         row.get("search_zip"), search_keyword, vertical, best_stage,
+                         None if best_url else "no_website",
+                         _now_eastern(), source_job_id, existing["id"]),
+                    )
+                    conn.commit()
+                    return True
+                return False
             conn.execute(
                 "INSERT INTO businesses "
                 "(business_name, address, city, phone, website_url, rating, review_count, category, zip_code, search_zip, "
